@@ -68,9 +68,11 @@ jobs:
         run: |
           set -euo pipefail
           BIN=$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.1 use -p path)
-          echo "TEST_ASSET_ETCD=${BIN}/etcd"                   >> "$GITHUB_ENV"
-          echo "TEST_ASSET_KUBE_APISERVER=${BIN}/kube-apiserver" >> "$GITHUB_ENV"
-          echo "TEST_ASSET_KUBECTL=${BIN}/kubectl"             >> "$GITHUB_ENV"
+          {
+            echo "TEST_ASSET_ETCD=${BIN}/etcd"
+            echo "TEST_ASSET_KUBE_APISERVER=${BIN}/kube-apiserver"
+            echo "TEST_ASSET_KUBECTL=${BIN}/kubectl"
+          } >> "$GITHUB_ENV"
 
       - name: Write the solver fixture credentials
         if: steps.check.outputs.skip != 'true'

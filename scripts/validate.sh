@@ -25,6 +25,11 @@ head_() { printf '\n== %s ==\n' "$1"; }
 # ── 1. actionlint (also validates YAML syntax) ───────────────────────────────
 head_ "actionlint / YAML syntax"
 if command -v actionlint >/dev/null 2>&1; then
+  # actionlint shells out to shellcheck for run: blocks and silently skips it
+  # when absent. CI runners have it, so without this warning a local pass can
+  # disagree with CI — which is exactly how SC2129 reached a pull request.
+  command -v shellcheck >/dev/null 2>&1 \
+    || echo "  warn  shellcheck missing — run: blocks will NOT be linted here, but will be in CI"
   if out=$(actionlint "$WF"/*.y*ml 2>&1); then ok "no findings"; else bad "findings:"; echo "$out"; fi
 else
   bad "actionlint not installed"
