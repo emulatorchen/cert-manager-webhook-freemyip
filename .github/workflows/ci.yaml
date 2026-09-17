@@ -45,31 +45,17 @@ jobs:
           platforms: linux/amd64
           push: false
 
-  workflows:
-    name: "Validate workflows"
+  test:
+    name: "Unit tests"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
-      - name: Install actionlint v1.7.12
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
-            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
-          tar xzf actionlint.tar.gz actionlint
-          sudo mv actionlint /usr/local/bin/actionlint
-          rm -f actionlint.tar.gz
-
-      - name: Install zizmor v1.23.1
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
-            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
-          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
-          tar xzf zizmor.tar.gz
-          sudo mv zizmor /usr/local/bin/zizmor
-          rm -f zizmor.tar.gz
-
-      - name: Run supply-chain validation
-        run: ./scripts/validate.sh
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      # The conformance suite in main_test.go needs a live freemyip token and
+      # an envtest control plane, so it lives in the integration workflow.
+      # -short keeps this to what can run without either.
+      - run: go test -short ./freemyip/...

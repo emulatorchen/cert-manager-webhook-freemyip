@@ -1,0 +1,151 @@
+name: workflow-security
+
+# scripts/validate.sh enforces our own hard rules and fails on any breach.
+# This runs zizmor's full ruleset, which is broader and noisier, so it gates on
+# the delta instead: a pull request fails only for findings it introduces.
+# Pre-existing findings are reported, never blocking.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: workflow-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: "Workflow static analysis"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install zizmor v1.23.1
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          sudo mv zizmor /usr/local/bin/zizmor
+          rm -f zizmor.tar.gz
+
+      - name: Scan
+        run: zizmor --format sarif .github/workflows/ > zizmor.sarif 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+      # Fingerprint is rule + file, deliberately without the line number, so
+      # moving code around does not read as a new finding.
+      - name: Compute delta against the base branch
+        if: github.event_name == 'pull_request'
+        id: delta
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git worktree add /tmp/base-wt "origin/${BASE_REF}" --quiet 2>/dev/null || true
+          zizmor --format sarif /tmp/base-wt/.github/workflows/ > /tmp/base.sarif 2>/dev/null || true
+          git worktree remove /tmp/base-wt --force 2>/dev/null || true
+
+          fp() {
+            jq -r '.runs[].results[]? |
+              "\(.ruleId):\(.locations[0].physicalLocation.artifactLocation.uri)"' \
+              "$1" 2>/dev/null | sort -u
+          }
+
+          NEW=$(comm -13 <(fp /tmp/base.sarif) <(fp zizmor.sarif) | grep -v '^$' || true)
+          PRE=$(jq -r '.runs[].results[]? |
+            "\(.ruleId):\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine // 0)"' \
+            zizmor.sarif 2>/dev/null | sort -u | grep -v '^$' || true)
+
+          printf '%s\n' "$NEW" > /tmp/new.txt
+          printf '%s\n' "$PRE" > /tmp/pre.txt
+          if [ -n "$NEW" ]; then echo "has_new=true" >> "$GITHUB_OUTPUT"; else echo "has_new=false" >> "$GITHUB_OUTPUT"; fi
+
+      # Fork pull requests get a read-only token, so skip commenting there
+      # rather than failing the job on a permissions error.
+      - name: Comment on the pull request
+        if: |
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          NEW=$(cat /tmp/new.txt); [ -n "$NEW" ] || NEW="None"
+          PRE=$(cat /tmp/pre.txt); [ -n "$PRE" ] || PRE="None"
+          {
+            echo "<!-- workflow-security-zizmor -->"
+            echo ""
+            echo "## Workflow static analysis"
+            echo ""
+            echo "### Introduced by this pull request (blocking)"
+            echo '```'; echo "$NEW"; echo '```'
+            echo ""
+            echo "### Already present (not blocking)"
+            echo '```'; echo "$PRE"; echo '```'
+          } > /tmp/body.txt
+
+          CID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- workflow-security-zizmor -->")) | .id' \
+            2>/dev/null | head -1 || true)
+          if [ -n "$CID" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${CID}" -F body=@/tmp/body.txt >/dev/null
+          else
+            gh api --method POST "repos/${REPO}/issues/${PR}/comments" -F body=@/tmp/body.txt >/dev/null
+          fi
+
+      - name: Fail on newly introduced findings
+        if: github.event_name == 'pull_request' && steps.delta.outputs.has_new == 'true'
+        run: |
+          echo "This pull request introduces workflow security findings:"
+          cat /tmp/new.txt
+          exit 1
+
+  validate:
+    name: "Supply-chain rules"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint v1.7.12
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          sudo mv actionlint /usr/local/bin/actionlint
+          rm -f actionlint.tar.gz
+
+      - name: Install zizmor v1.23.1
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          sudo mv zizmor /usr/local/bin/zizmor
+          rm -f zizmor.tar.gz
+
+      - run: ./scripts/validate.sh

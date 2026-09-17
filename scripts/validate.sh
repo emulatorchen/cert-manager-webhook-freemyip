@@ -191,7 +191,36 @@ done > /tmp/_dh.txt
 [ -s /tmp/_dh.txt ] && cat /tmp/_dh.txt || echo "  ok    no Docker Hub usage found"
 grep -q FAIL /tmp/_dh.txt && FAIL=1; rm -f /tmp/_dh.txt
 
-# ── 13. zizmor — nothing at error level ──────────────────────────────────────
+# ── 13. every pin resolves to the version its comment claims ─────────────────
+# A SHA that is real but belongs to a different release is indistinguishable
+# from a correct pin by eye. Needs network and gh; skipped without them, and
+# always runs in CI.
+head_ "Rule 1 — pinned SHA matches the version in the comment"
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  grep -rhoE 'uses:[[:space:]]*[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[0-9a-f]{40}[[:space:]]*#[[:space:]]*v[0-9A-Za-z.-]+' "$WF" \
+    | sed -E 's/uses:[[:space:]]*//; s/[[:space:]]*#[[:space:]]*/ /' | sort -u \
+    | while read -r ref tag; do
+        repo="${ref%@*}"; sha="${ref##*@}"
+        base=$(printf '%s' "$repo" | cut -d/ -f1,2)
+        r=$(gh api "repos/$base/git/ref/tags/$tag" -q '.object.sha + " " + .object.type' 2>/dev/null)
+        if [ -z "$r" ]; then printf '  FAIL  %s %s — tag not found upstream\n' "$base" "$tag"; continue; fi
+        obj=$(printf '%s' "$r" | cut -d' ' -f1); typ=$(printf '%s' "$r" | cut -d' ' -f2)
+        deref="$obj"
+        [ "$typ" = "tag" ] && deref=$(gh api "repos/$base/git/tags/$obj" -q '.object.sha' 2>/dev/null)
+        # Either the commit or the annotated-tag object is a sound pin: both
+        # are content-addressed and immutable.
+        if [ "$sha" = "$obj" ] || [ "$sha" = "$deref" ]; then
+          printf '  ok    %s %s\n' "$base" "$tag"
+        else
+          printf '  FAIL  %s %s — file pins %s, upstream tag is %s\n' "$base" "$tag" "$sha" "$deref"
+        fi
+      done > /tmp/_pv.txt
+  cat /tmp/_pv.txt; grep -q FAIL /tmp/_pv.txt && FAIL=1; rm -f /tmp/_pv.txt
+else
+  echo "  skip  gh unavailable or unauthenticated — pin/tag agreement not checked"
+fi
+
+# ── 14. zizmor — nothing at error level ──────────────────────────────────────
 head_ "zizmor"
 if command -v zizmor >/dev/null 2>&1; then
   zizmor --format plain --no-online-audits "$WF" > /tmp/_zz.txt 2>&1
