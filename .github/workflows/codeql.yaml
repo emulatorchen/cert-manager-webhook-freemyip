@@ -1,0 +1,47 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Monday 08:00 UTC — catches advisories published since the last push.
+    - cron: "0 8 * * 1"
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: "Analyze Go"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          languages: go
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          category: "/language:go"

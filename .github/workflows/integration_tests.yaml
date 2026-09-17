@@ -1,0 +1,221 @@
+name: integration-tests
+
+# Two tiers against the real freemyip API:
+#
+#   conformance — cert-manager's DNS-01 solver suite. Drives Present and
+#                 CleanUp and checks the TXT record actually propagates. No
+#                 certificate is issued. Runs on every pull request.
+#   staging     — the whole path end to end: kind, cert-manager, this chart,
+#                 and a real Let's Encrypt staging certificate. Manual.
+#
+# The freemyip token and domain are shared with docker-nginx-lego, and freemyip
+# holds exactly one TXT value per domain, so the two tiers must never overlap.
+# One concurrency group covers the whole workflow, and each tier requests a
+# single DNS name — a wildcard plus apex would need two simultaneous challenges
+# on the same name, which freemyip cannot represent.
+#
+# Repository variable: FREEMYIP_DOMAIN   e.g. this.freemyip.com
+# Repository secrets (both repo level, neither can publish anything):
+#   FREEMYIP_TOKEN, and CERTBOT_EMAIL for the staging tier.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: freemyip-dns
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: "DNS-01 conformance"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Fork pull requests get no secrets. Skip cleanly rather than fail.
+      - name: Check configuration
+        id: check
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "FREEMYIP_TOKEN not available (fork or unconfigured) — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$DOMAIN" ]; then
+            echo "FREEMYIP_TOKEN is set but the FREEMYIP_DOMAIN variable is missing"
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.check.outputs.skip != 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: steps.check.outputs.skip != 'true'
+        with:
+          go-version-file: go.mod
+
+      # cert-manager's fixture starts an envtest control plane and looks for
+      # etcd, kube-apiserver and kubectl on PATH, panicking without them.
+      - name: Provision the envtest control plane
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BIN=$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.1 use -p path)
+          {
+            echo "TEST_ASSET_ETCD=${BIN}/etcd"
+            echo "TEST_ASSET_KUBE_APISERVER=${BIN}/kube-apiserver"
+            echo "TEST_ASSET_KUBECTL=${BIN}/kubectl"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the solver fixture credentials
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+        run: |
+          umask 077
+          cat > testdata/freemyip/api-key.yml <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: freemyip-token
+            namespace: cert-manager
+          type: Opaque
+          stringData:
+            "token": "${TOKEN}"
+          EOF
+
+      - name: Run the conformance suite
+        if: steps.check.outputs.skip != 'true'
+        env:
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+        run: |
+          set -euo pipefail
+          TEST_ZONE_NAME="${DOMAIN}." DNS_NAME="${DOMAIN}" go test -v -timeout 15m ./...
+
+      - name: Remove the credentials
+        if: always()
+        run: rm -f testdata/freemyip/api-key.yml
+
+  staging_certificate:
+    name: "Let's Encrypt staging certificate"
+    if: github.event_name == 'workflow_dispatch'
+    needs: conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check configuration
+        id: check
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$DOMAIN" ] || [ -z "$EMAIL" ]; then
+            echo "FREEMYIP_TOKEN, FREEMYIP_DOMAIN or CERTBOT_EMAIL missing — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.check.outputs.skip != 'true'
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        if: steps.check.outputs.skip != 'true'
+
+      - name: Build the webhook image
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: webhook:e2e
+
+      - name: Create a kind cluster
+        if: steps.check.outputs.skip != 'true'
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: e2e
+
+      - name: Install cert-manager and the webhook
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          set -euo pipefail
+          kind load docker-image webhook:e2e --name e2e
+
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update jetstack
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            --set crds.enabled=true \
+            --wait --timeout 10m
+
+          # A values file rather than --set: the value never reaches the
+          # process list, where anything on the runner could read it.
+          umask 077
+          cat > /tmp/e2e-values.yaml <<EOF
+          image:
+            repository: webhook
+            tag: e2e
+            pullPolicy: Never
+          freemyip:
+            "token": "${TOKEN}"
+          clusterIssuer:
+            email: "${EMAIL}"
+            staging:
+              create: true
+          EOF
+
+          helm upgrade --install cert-manager-webhook-freemyip \
+            charts/cert-manager-webhook-freemyip \
+            --namespace cert-manager \
+            -f /tmp/e2e-values.yaml \
+            --wait --timeout 5m
+          rm -f /tmp/e2e-values.yaml
+
+      - name: Request a staging certificate
+        if: steps.check.outputs.skip != 'true'
+        env:
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+        run: |
+          set -euo pipefail
+          # One DNS name only: freemyip stores a single TXT value per domain.
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: e2e
+            namespace: default
+          spec:
+            secretName: e2e-tls
+            issuerRef:
+              name: cert-manager-webhook-freemyip-staging
+              kind: ClusterIssuer
+            dnsNames:
+              - ${DOMAIN}
+          EOF
+          kubectl wait --for=condition=Ready certificate/e2e -n default --timeout=25m
+
+      - name: Show what happened on failure
+        if: failure() && steps.check.outputs.skip != 'true'
+        run: |
+          kubectl describe certificate/e2e -n default || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl logs -n cert-manager -l app.kubernetes.io/name=cert-manager-webhook-freemyip --tail=200 || true
+          kubectl logs -n cert-manager -l app=cert-manager --tail=200 || true
+
+      - name: Clean up the challenge record
+        if: always() && steps.check.outputs.skip != 'true'
+        run: kubectl delete certificate/e2e -n default --ignore-not-found

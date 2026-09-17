@@ -1,0 +1,17 @@
+# zizmor suppressions. Every entry needs a reason — an unexplained ignore is
+# indistinguishable from an oversight.
+
+rules:
+  secrets-outside-env:
+    ignore:
+      # FREEMYIP_TOKEN and CERTBOT_EMAIL are deliberately repository secrets
+      # rather than release-environment secrets. Neither can publish anything:
+      # the token only writes a TXT record on one freemyip domain, and the
+      # address is only used to register with Let's Encrypt staging. They have
+      # to be reachable from pull request jobs, which is exactly what a
+      # dedicated environment would prevent.
+      #
+      # The rule remains active everywhere else, so a publish credential
+      # appearing outside environment: release still fails the build — and
+      # scripts/validate.sh asserts that separately.
+      - integration_tests.yaml
