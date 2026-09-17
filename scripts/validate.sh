@@ -130,7 +130,68 @@ for f in "$WF"/*.y*ml; do
   grep -q '^concurrency:' "$f" && ok "$(basename "$f")" || bad "$(basename "$f"): no concurrency group"
 done
 
-# ── 9. zizmor — nothing at error level ───────────────────────────────────────
+# ── 9. release workflow is human-triggered only ──────────────────────────────
+# A tag push is not an explicit release decision: anything that can create a
+# ref can start it. workflow_dispatch forces a person to press the button.
+head_ "Rule 3 — release runs only on workflow_dispatch"
+for f in "$WF"/release.y*ml; do
+  [ -e "$f" ] || continue
+  trig=$(awk '/^on:/{o=1;next} /^[^[:space:]]/{o=0} o' "$f")
+  printf '%s' "$trig" | grep -q 'workflow_dispatch' || bad "$(basename "$f"): no workflow_dispatch trigger"
+  if printf '%s' "$trig" | grep -qE '^[[:space:]]*(push|pull_request|schedule):'; then
+    bad "$(basename "$f"): has an automatic trigger — publishing must be human-initiated"
+    printf '%s\n' "$trig" | grep -E '^[[:space:]]*(push|pull_request|schedule):' | sed 's/^/        /'
+  else
+    ok "$(basename "$f"): workflow_dispatch only"
+  fi
+done
+
+# ── 10. cancellation cleanup for non-atomic registries ───────────────────────
+# Docker Hub publishes tag by tag, so a cancel mid-run leaves a half-released
+# version behind. Something has to clean that up.
+head_ "Rule 6 — cancellation cleanup present"
+for f in "$WF"/release.y*ml; do
+  [ -e "$f" ] || continue
+  grep -qE 'if:[[:space:]]*cancelled\(\)' "$f" \
+    && ok "$(basename "$f"): has a cancelled() cleanup job" \
+    || bad "$(basename "$f"): no cancelled() cleanup job"
+done
+
+# ── 11. published images carry provenance and an SBOM ────────────────────────
+head_ "Supply chain — published images are attested"
+for f in "$WF"/release.y*ml; do
+  [ -e "$f" ] || continue
+  if grep -qE 'push:[[:space:]]*true' "$f"; then
+    grep -qE '^[[:space:]]*provenance:' "$f" && ok "$(basename "$f"): provenance set" \
+                                             || bad "$(basename "$f"): pushes without provenance:"
+    grep -qE '^[[:space:]]*sbom:' "$f"       && ok "$(basename "$f"): sbom set" \
+                                             || bad "$(basename "$f"): pushes without sbom:"
+  fi
+done
+
+# ── 12. Docker Hub credentials only inside release-gated jobs ────────────────
+# Only credentials are gated. A repository variable holding the Docker Hub
+# repository name is not one, so this matches secrets.DOCKERHUB* specifically.
+head_ "Rule 4 — Docker Hub credentials only in release-gated jobs"
+for f in "$WF"/*.y*ml; do
+  grep -qE 'secrets\.DOCKERHUB' "$f" || continue
+  awk -v F="$(basename "$f")" '
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=""; next }
+    injobs {body = body $0 "\n"}
+    END {if (job!="") flush()}
+    function flush() {
+      if (body ~ /secrets\.DOCKERHUB/) {
+        if (body ~ /environment:[[:space:]]*release/) printf "  ok    %s:%s gated\n", F, job
+        else                                          printf "  FAIL  %s:%s uses Docker Hub outside environment: release\n", F, job
+      }
+    }
+  ' "$f"
+done > /tmp/_dh.txt
+[ -s /tmp/_dh.txt ] && cat /tmp/_dh.txt || echo "  ok    no Docker Hub usage found"
+grep -q FAIL /tmp/_dh.txt && FAIL=1; rm -f /tmp/_dh.txt
+
+# ── 13. zizmor — nothing at error level ──────────────────────────────────────
 head_ "zizmor"
 if command -v zizmor >/dev/null 2>&1; then
   zizmor --format plain --no-online-audits "$WF" > /tmp/_zz.txt 2>&1

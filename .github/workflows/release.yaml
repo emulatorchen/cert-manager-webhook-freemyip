@@ -1,11 +1,25 @@
 name: release
 
+# Releases are started by a person, never by a ref appearing. Every job that
+# can publish declares environment: release, so it parks for a reviewer before
+# any credential is exposed to it.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.2.0). Blank uses the chart appVersion."
+        required: false
+        default: ""
+      notes:
+        description: "Release notes. Blank auto-generates them from merged pull requests."
+        required: false
+        default: ""
+      skip_security_scan:
+        description: "Skip the vulnerability gate — emergency hotfix only, still needs reviewer approval"
+        type: boolean
+        default: false
 
-# A release must never race another release, and must never be cancelled
-# half-published.
+# A release must never race another, and must never be cancelled half-published.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -14,17 +28,15 @@ permissions:
   contents: read
 
 jobs:
-  release:
-    name: "Publish image and chart"
+  resolve:
+    name: "Resolve version"
     runs-on: ubuntu-latest
-    # Publishing is gated on the release environment: the job pauses for a
-    # required reviewer before any credential is available to it.
-    environment: release
-    permissions:
-      contents: read
-      # Scoped to this job only — nothing else in the workflow can write
-      # packages.
-      packages: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      ghcr_image: ${{ steps.v.outputs.ghcr_image }}
+      hub_image: ${{ steps.v.outputs.hub_image }}
+      charts: ${{ steps.v.outputs.charts }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -33,38 +45,283 @@ jobs:
       # ghcr.io rejects uppercase in repository names, but github.repository
       # and github.repository_owner preserve the owner's casing.
       - name: Resolve version and targets
-        id: meta
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
         run: |
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          echo "charts=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          if [ -z "$version" ]; then
+            version=$(grep -m1 '^appVersion:' charts/cert-manager-webhook-freemyip/Chart.yaml \
+                      | sed 's/^appVersion:[[:space:]]*//; s/"//g')
+          fi
+          [ -n "$version" ] || { echo "could not resolve a version"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
+            echo "tag v${version} already exists — bump the version, or delete the tag to re-release"
+            exit 1
+          fi
+          if [ -z "$HUB_REPO" ]; then
+            echo "repository variable DOCKERHUB_REPOSITORY is not set (expected e.g. emulator/cert-manager-webhook-freemyip)"
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=v${version}"
+            echo "ghcr_image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "hub_image=${HUB_REPO}"
+            echo "charts=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing ${version} to ghcr.io/${GITHUB_REPOSITORY,,} and ${HUB_REPO}"
 
+  verify:
+    name: "Build and vet"
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - name: Lint and render the chart
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          helm lint charts/cert-manager-webhook-freemyip
+          helm template release-check charts/cert-manager-webhook-freemyip \
+            --set image.tag="$VERSION" > /dev/null
+
+  scan:
+    name: "Vulnerability gate"
+    needs: [resolve, verify]
+    if: ${{ !inputs.skip_security_scan }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # Reachability-aware: only reports advisories our code can actually call.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build the release image locally for scanning
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: scan-target:release
+
+      # exit-code 1 — this gate blocks the release rather than reporting.
+      - name: Scan the image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: scan-target:release
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-release.sarif
+          exit-code: 1
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-release.sarif
+          category: trivy-release
+
+  publish_image:
+    name: "Publish image"
+    needs: [resolve, verify, scan]
+    if: |
+      always() &&
+      needs.resolve.result == 'success' &&
+      needs.verify.result == 'success' &&
+      (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      # Both are needed by attest-build-provenance: attestations to record it,
+      # and OIDC to prove to Sigstore which workflow produced the image.
+      attestations: write
+      "id-token": write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      # Credentials go in over stdin rather than as an action input, so they
+      # never appear as a literal in the workflow file.
+      - name: Log in to ghcr.io
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Log in to Docker Hub
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: printf '%s' "$HUB_PAT" | docker login docker.io -u "$HUB_USER" --password-stdin
+
+      # latest moves only here, in a reviewer-gated release — never from CI.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.ghcr_image }}:latest
+            ${{ needs.resolve.outputs.hub_image }}:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.hub_image }}:latest
 
-      # Every value reaches the shell through env: — an expansion interpolated
-      # straight into a run: block is a code-injection sink.
-      - name: Push helm chart
+      - name: Attest the ghcr image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.resolve.outputs.ghcr_image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the Docker Hub image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.resolve.outputs.hub_image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: false
+
+  publish_chart:
+    name: "Publish chart"
+    needs: [resolve, publish_image]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Package and push the chart
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          CHARTS: ${{ steps.meta.outputs.charts }}
+          GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHARTS: ${{ needs.resolve.outputs.charts }}
         run: |
-          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
+          printf '%s' "$GHCR_PAT" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
           helm package charts/cert-manager-webhook-freemyip \
             --version "$VERSION" \
             --app-version "$VERSION"
           helm push "cert-manager-webhook-freemyip-${VERSION}.tgz" "$CHARTS"
+
+      - name: Keep the packaged chart for the release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chart
+          path: cert-manager-webhook-freemyip-*.tgz
+          if-no-files-found: error
+
+  github_release:
+    name: "Create GitHub release"
+    needs: [resolve, publish_image, publish_chart]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: chart
+
+      # gh release create makes the tag, so nothing pushes a ref before the
+      # artifacts are actually published.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$NOTES" ]; then
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --latest \
+              cert-manager-webhook-freemyip-*.tgz
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
+              cert-manager-webhook-freemyip-*.tgz
+          fi
+          {
+            echo "### Released ${TAG}"
+            echo ""
+            echo "- \`${GHCR_IMAGE}:${VERSION}\`"
+            echo "- \`${HUB_IMAGE}:${VERSION}\`"
+            echo "- chart \`${VERSION}\` pushed to the ghcr OCI registry"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup_on_cancel:
+    name: "⚠️ Approve to DELETE partially published tags — NOT a release"
+    needs: [resolve]
+    if: cancelled()
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      # Docker Hub publishes tag by tag, so a cancel mid-push can leave a
+      # half-released version behind. ghcr is not cleaned up here: its
+      # versioned tags are overwritable, so a retry corrects them.
+      - name: Delete the tags this run may have pushed
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          if [ -z "${VERSION:-}" ]; then
+            echo "no version resolved — nothing this run could have pushed"
+            exit 0
+          fi
+          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PAT}\"}" \
+            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
+          if [ -z "$jwt" ]; then
+            echo "could not authenticate to the Docker Hub API — delete the tags by hand"
+            exit 1
+          fi
+          for tag in "$VERSION" latest; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+              "https://hub.docker.com/v2/repositories/${HUB_IMAGE}/tags/${tag}/" \
+              -H "Authorization: Bearer ${jwt}")
+            echo "delete ${HUB_IMAGE}:${tag} -> ${code}"
+          done
