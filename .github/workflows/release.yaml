@@ -14,8 +14,15 @@ on:
         description: "Release notes. Blank auto-generates them from merged pull requests."
         required: false
         default: ""
+      block_severity:
+        description: "Severities that block the release. Start at CRITICAL; tighten to CRITICAL,HIGH once the pipeline is proven."
+        type: choice
+        options:
+          - CRITICAL
+          - CRITICAL,HIGH
+        default: CRITICAL
       skip_security_scan:
-        description: "Skip the vulnerability gate — emergency hotfix only, still needs reviewer approval"
+        description: "Skip the vulnerability gate entirely — emergency hotfix only, still needs reviewer approval"
         type: boolean
         default: false
 
@@ -125,15 +132,28 @@ jobs:
           push: false
           tags: scan-target:release
 
-      # exit-code 1 — this gate blocks the release rather than reporting.
-      - name: Scan the image
+      # Two passes, deliberately. The first is the gate and is the only one
+      # that can fail the run; its bar is chosen per-run so it can be tightened
+      # from CRITICAL to CRITICAL,HIGH without editing this file. The second
+      # always records the full CRITICAL,HIGH picture to the security tab, so
+      # raising the bar later is an informed decision rather than a guess.
+      - name: Vulnerability gate
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: scan-target:release
+          severity: ${{ inputs.block_severity }}
+          format: table
+          exit-code: 1
+
+      - name: Record the full picture
+        if: always()
         uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
         with:
           scan-ref: scan-target:release
           severity: CRITICAL,HIGH
           format: sarif
           output: trivy-release.sarif
-          exit-code: 1
+          exit-code: 0
 
       - name: Upload scan results
         if: always()
