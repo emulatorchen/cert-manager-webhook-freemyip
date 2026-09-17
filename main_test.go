@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cert-manager/cert-manager/test/acme"
+	acme "github.com/cert-manager/cert-manager/test/acme"
 	"github.com/emulatorchen/cert-manager-webhook-freemyip/freemyip"
 )
 
@@ -19,7 +19,6 @@ func TestRunsSuite(t *testing.T) {
 	//   DNS_NAME=example.freemyip.com
 	// and testdata/freemyip/config.json + testdata/freemyip/api-key.yml to be present.
 	fixture := acme.NewFixture(freemyip.NewSolver(),
-		acme.SetBinariesPath("__main__/hack/bin"),
 		acme.SetResolvedZone(zone),
 		acme.SetDNSName(dnsName),
 		acme.SetAllowAmbientCredentials(false),

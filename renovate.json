@@ -1,0 +1,55 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":prHourlyLimitNone"
+  ],
+  "labels": ["dependencies"],
+  "prHourlyLimit": 0,
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-optional",
+  "rebaseWhen": "behind-base-branch",
+  "postUpdateOptions": ["gomodTidy"],
+  "packageRules": [
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "pinDigests": true
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "Go dependencies"
+    },
+    {
+      "description": "k8s.io/* and controller-runtime versions are dictated by the cert-manager release; bumping them past it breaks the build. They move via go mod tidy when cert-manager itself is bumped.",
+      "matchDatasources": ["go"],
+      "matchPackageNames": [
+        "k8s.io/api",
+        "k8s.io/apimachinery",
+        "k8s.io/apiextensions-apiserver",
+        "k8s.io/apiserver",
+        "k8s.io/client-go",
+        "k8s.io/component-base",
+        "sigs.k8s.io/controller-runtime"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "groupName": "Docker base images"
+    }
+  ]
+}

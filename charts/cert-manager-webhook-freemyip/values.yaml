@@ -22,7 +22,8 @@ clusterIssuer:
 
 image:
   repository: ghcr.io/emulatorchen/cert-manager-webhook-freemyip
-  tag: "0.1.0"
+  # Defaults to the chart appVersion when empty.
+  tag: ""
   pullPolicy: IfNotPresent
 
 certManager:
