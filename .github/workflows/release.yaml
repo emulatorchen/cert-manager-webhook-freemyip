@@ -42,9 +42,15 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       ghcr_image: ${{ steps.v.outputs.ghcr_image }}
+      # Two forms on purpose: the registry wants docker.io/owner/name, the
+      # Docker Hub web API wants owner/name.
       hub_image: ${{ steps.v.outputs.hub_image }}
+      hub_repo: ${{ steps.v.outputs.hub_repo }}
       charts: ${{ steps.v.outputs.charts }}
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -76,7 +82,10 @@ jobs:
             echo "version=${version}"
             echo "tag=v${version}"
             echo "ghcr_image=ghcr.io/${GITHUB_REPOSITORY,,}"
-            echo "hub_image=${HUB_REPO}"
+            # Fully qualified for the registry and for attestation subjects,
+            # which reject a bare owner/name.
+            echo "hub_image=docker.io/${HUB_REPO}"
+            echo "hub_repo=${HUB_REPO}"
             echo "charts=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
           } >> "$GITHUB_OUTPUT"
           echo "Releasing ${version} to ghcr.io/${GITHUB_REPOSITORY,,} and ${HUB_REPO}"
@@ -86,6 +95,9 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -102,6 +114,47 @@ jobs:
           helm template release-check charts/cert-manager-webhook-freemyip \
             --set image.tag="$VERSION" > /dev/null
 
+  # The workflows are part of the supply chain too: they hold the credentials
+  # and decide what gets published. Scanning the artifact but not the thing
+  # that publishes it leaves the more privileged half unchecked.
+  workflow_scan:
+    name: "Workflow security gate"
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Extracted onto PATH rather than installed system-wide: each tool is
+      # used by one step, so elevating for it buys nothing.
+      - name: Install actionlint v1.7.12 and zizmor v1.23.1
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/bin/"
+
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          mv zizmor "${RUNNER_TEMP}/bin/"
+
+          rm -f actionlint.tar.gz zizmor.tar.gz
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      - name: Scan the workflows
+        env:
+          BLOCK_SEVERITY: ${{ inputs.block_severity }}
+        run: ./scripts/validate.sh
+
   scan:
     name: "Vulnerability gate"
     needs: [resolve, verify]
@@ -111,6 +164,9 @@ jobs:
       contents: read
       security-events: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -119,8 +175,28 @@ jobs:
           go-version-file: go.mod
 
       # Reachability-aware: only reports advisories our code can actually call.
+      #
+      # The Go advisory database carries no severity, so this cannot be filtered
+      # the way the image scan can. It follows the same bar instead: at
+      # CRITICAL it reports and lets the release through, at CRITICAL,HIGH it
+      # blocks. Findings are always printed either way.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        env:
+          BLOCK: ${{ inputs.block_severity }}
+        run: |
+          if go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...; then
+            echo "no reachable vulnerabilities"
+          else
+            case "$BLOCK" in
+              *HIGH*)
+                echo "::error::govulncheck found reachable vulnerabilities and the bar is ${BLOCK}"
+                exit 1
+                ;;
+              *)
+                echo "::warning::govulncheck found reachable vulnerabilities — not blocking at the ${BLOCK} bar"
+                ;;
+            esac
+          fi
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build the release image locally for scanning
@@ -164,11 +240,12 @@ jobs:
 
   publish_image:
     name: "Publish image"
-    needs: [resolve, verify, scan]
+    needs: [resolve, verify, workflow_scan, scan]
     if: |
       always() &&
       needs.resolve.result == 'success' &&
       needs.verify.result == 'success' &&
+      needs.workflow_scan.result == 'success' &&
       (needs.scan.result == 'success' || needs.scan.result == 'skipped')
     runs-on: ubuntu-latest
     environment: release
@@ -182,6 +259,9 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -241,6 +321,9 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -267,12 +350,18 @@ jobs:
 
   github_release:
     name: "Create GitHub release"
-    needs: [resolve, publish_image, publish_chart]
+    # Behind release_gate rather than the publish jobs directly, so the
+    # release is only announced once every gate and both publishes have been
+    # confirmed together.
+    needs: [resolve, release_gate]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -316,6 +405,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       # Docker Hub publishes tag by tag, so a cancel mid-push can leave a
       # half-released version behind. ghcr is not cleaned up here: its
       # versioned tags are overwritable, so a retry corrects them.
@@ -323,7 +415,9 @@ jobs:
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          # hub_repo, not hub_image: the Hub web API addresses repositories as
+          # owner/name, with no registry prefix.
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -uo pipefail
@@ -341,7 +435,92 @@ jobs:
           fi
           for tag in "$VERSION" latest; do
             code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-              "https://hub.docker.com/v2/repositories/${HUB_IMAGE}/tags/${tag}/" \
+              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${tag}/" \
               -H "Authorization: Bearer ${jwt}")
-            echo "delete ${HUB_IMAGE}:${tag} -> ${code}"
+            echo "delete ${HUB_REPO}:${tag} -> ${code}"
           done
+
+  # Aggregate the publish jobs before the release is announced, so a partial
+  # publish does not get a GitHub release attached to it.
+  release_gate:
+    name: "Release gate"
+    needs: [resolve, verify, workflow_scan, scan, publish_image, publish_chart]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check every gate and publish job
+        env:
+          # Through env, never interpolated into the shell: an expansion
+          # inside a run block is a code-injection sink.
+          REQUIRED: >-
+            ${{ needs.resolve.result }} ${{ needs.verify.result }}
+            ${{ needs.workflow_scan.result }}
+            ${{ needs.publish_image.result }} ${{ needs.publish_chart.result }}
+          SCAN: ${{ needs.scan.result }}
+        run: |
+          echo "required: $REQUIRED"
+          echo "scan:     $SCAN"
+          for r in $REQUIRED; do
+            [ "$r" = "success" ] || { echo "::error::release blocked: a required job did not succeed"; exit 1; }
+          done
+          # scan is the only one allowed to be skipped, via skip_security_scan.
+          case "$SCAN" in
+            success|skipped) ;;
+            *) echo "::error::release blocked: the vulnerability gate failed"; exit 1 ;;
+          esac
+          echo "all gates passed"
+
+  # Scan what was actually published, not what was built. The image on the
+  # registry is the one people pull, and advisories land after a release as
+  # often as before one.
+  post_release_report:
+    name: "Post-release vulnerability report"
+    needs: [resolve, release_gate, github_release]
+    if: always() && needs.github_release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan the released image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-released.sarif
+          exit-code: 0
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-released.sarif
+          category: trivy-released
+
+      - name: Summarise
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          {
+            echo "### Released ${VERSION}"
+            echo ""
+            echo "- \`${GHCR_IMAGE}:${VERSION}\`"
+            echo "- \`${HUB_IMAGE}:${VERSION}\`"
+            echo ""
+            echo "Scan results for the published image are in the security tab"
+            echo "under the \`trivy-released\` category."
+          } >> "$GITHUB_STEP_SUMMARY"

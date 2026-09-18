@@ -34,7 +34,13 @@ jobs:
   conformance:
     name: "DNS-01 conformance"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 12
+    # No harden-runner here. Even in audit mode it stopped this job's raw UDP
+    # DNS with "write: operation not permitted" — the conformance fixture
+    # queries a resolver directly rather than going through the system
+    # resolver, which is the one thing harden-runner's interception does not
+    # expect. Every other job keeps it; this one would have to trade a working
+    # test for it.
     steps:
       # Fork pull requests get no secrets. Skip cleanly rather than fail.
       - name: Check configuration
@@ -79,13 +85,18 @@ jobs:
         env:
           TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
         run: |
+          # No namespace here on purpose. The fixture creates a throwaway
+          # namespace and applies this with kubectl --namespace <that one>;
+          # kubectl refuses when a manifest names a different namespace, and
+          # the solver looks the secret up in the challenge's namespace anyway.
+          # api-key.yml.sample keeps cert-manager, which is right for a real
+          # install and wrong here.
           umask 077
           cat > testdata/freemyip/api-key.yml <<EOF
           apiVersion: v1
           kind: Secret
           metadata:
             name: freemyip-token
-            namespace: cert-manager
           type: Opaque
           stringData:
             "token": "${TOKEN}"
@@ -97,7 +108,9 @@ jobs:
           DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
         run: |
           set -euo pipefail
-          TEST_ZONE_NAME="${DOMAIN}." DNS_NAME="${DOMAIN}" go test -v -timeout 15m ./...
+          TEST_ZONE_NAME="${DOMAIN}." \
+          DNS_NAME="${DOMAIN}" \
+            go test -v -timeout 10m ./...
 
       - name: Remove the credentials
         if: always()
@@ -105,11 +118,26 @@ jobs:
 
   staging_certificate:
     name: "Let's Encrypt staging certificate"
-    if: github.event_name == 'workflow_dispatch'
+    # This is the real proof, and it mirrors what docker-nginx-lego does: run
+    # the actual ACME flow and check a certificate comes out the other end.
+    # The ACME client does its own propagation waiting, so nothing here
+    # depends on the conformance fixture's DNS pre-check.
+    #
+    # needs: conformance is kept for ordering only — freemyip holds one TXT
+    # value per domain, so the two tiers must never overlap — but its result
+    # does not gate this. A conformance failure used to block the one test
+    # that answers the question.
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      needs.conformance.result != 'cancelled'
     needs: conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - name: Check configuration
         id: check
         env:
@@ -157,9 +185,25 @@ jobs:
 
           helm repo add jetstack https://charts.jetstack.io
           helm repo update jetstack
+
+          # Before asking Let's Encrypt to validate, cert-manager checks the
+          # record itself, by default against the zone's authoritative
+          # nameservers. From inside kind on a runner that lookup does not
+          # complete, so the challenge sits pending until the order expires —
+          # which is exactly what happened, with the webhook having already
+          # published the record correctly. Pin the self-check to recursive
+          # resolvers reachable over the path that works.
+          cat > /tmp/cm-values.yaml <<'EOF'
+          crds:
+            enabled: true
+          extraArgs:
+            - --dns01-recursive-nameservers-only
+            - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
+          EOF
+
           helm upgrade --install cert-manager jetstack/cert-manager \
             --namespace cert-manager --create-namespace \
-            --set crds.enabled=true \
+            -f /tmp/cm-values.yaml \
             --wait --timeout 10m
 
           # A values file rather than --set: the value never reaches the
@@ -206,16 +250,48 @@ jobs:
             dnsNames:
               - ${DOMAIN}
           EOF
-          kubectl wait --for=condition=Ready certificate/e2e -n default --timeout=25m
+          kubectl wait --for=condition=Ready certificate/e2e -n default --timeout=8m
 
       - name: Show what happened on failure
         if: failure() && steps.check.outputs.skip != 'true'
         run: |
           kubectl describe certificate/e2e -n default || true
           kubectl get certificaterequest,order,challenge -A || true
+          # The challenge's own status carries the reason it is stuck, which
+          # the summary table does not. Not having this cost a whole run.
+          kubectl describe challenge -A || true
+          kubectl describe order -A || true
           kubectl logs -n cert-manager -l app.kubernetes.io/name=cert-manager-webhook-freemyip --tail=200 || true
           kubectl logs -n cert-manager -l app=cert-manager --tail=200 || true
 
+      # Runs even when an earlier step failed, so the cluster may never have
+      # existed. Without the guard this reports a second, misleading failure
+      # against an API server that was never there.
       - name: Clean up the challenge record
         if: always() && steps.check.outputs.skip != 'true'
-        run: kubectl delete certificate/e2e -n default --ignore-not-found
+        run: kubectl delete certificate/e2e -n default --ignore-not-found || true
+
+  # One stable context for branch protection, so the ruleset does not have to
+  # name individual jobs. Skips count as success: the conformance tier skips
+  # cleanly on fork pull requests, and the staging tier only runs on dispatch.
+  integration_status:
+    name: "Integration status"
+    needs: [conformance, staging_certificate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check results
+        env:
+          RESULTS: ${{ needs.conformance.result }} ${{ needs.staging_certificate.result }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::an integration tier did not succeed"; exit 1 ;;
+            esac
+          done
+          echo "all integration tiers succeeded or were skipped"

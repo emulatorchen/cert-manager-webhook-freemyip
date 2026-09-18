@@ -14,10 +14,46 @@ permissions:
   contents: read
 
 jobs:
+  # Skip the expensive jobs when a change cannot affect them. A push to main
+  # always runs everything, so main is never green on a stale skip.
+  changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            go:
+              - "**/*.go"
+              - "go.mod"
+              - "go.sum"
+            image:
+              - "Dockerfile"
+              - "**/*.go"
+              - "go.mod"
+              - "go.sum"
+
   build:
     name: "Build and vet"
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # Audits what the job talks to, so an action that starts reaching
+      # somewhere new is visible rather than silent.
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Do not leave the job token in .git/config where a later step or a
@@ -31,24 +67,60 @@ jobs:
 
   image:
     name: "Build image"
+    needs: changes
+    if: needs.changes.outputs.image == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
       # No registry login and push: false — a pull_request job must never hold
-      # publish capability.
+      # publish capability. load: true keeps the image for the scan below.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
+          load: true
           push: false
+          tags: scan-target:ci
+
+      # Reporting, not gating. The release workflow is where the blocking
+      # scan lives; this exists so a pull request that introduces a vulnerable
+      # base image or dependency shows it here, rather than surfacing only
+      # when someone dispatches a release.
+      - name: Scan the image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: scan-target:ci
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-ci.sarif
+          exit-code: 0
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-ci.sarif
+          category: trivy-ci
 
   test:
     name: "Unit tests"
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -59,3 +131,36 @@ jobs:
       # an envtest control plane, so it lives in the integration workflow.
       # -short keeps this to what can run without either.
       - run: go test -short ./freemyip/...
+
+      # Reachability-aware, and cheap enough to run on every pull request.
+      # Reporting only here; the release workflow decides whether findings
+      # block, so a pull request surfaces them without being unmergeable.
+      - name: govulncheck
+        run: |
+          if go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...; then
+            echo "no reachable vulnerabilities"
+          else
+            echo "::warning::govulncheck found reachable vulnerabilities — the release gate blocks on these at CRITICAL,HIGH"
+          fi
+
+  # One stable context for branch protection to require. Without it the
+  # ruleset has to name every job, which silently stops enforcing anything the
+  # moment a job is renamed or a skip turns into a pass.
+  ci_status:
+    name: "CI status"
+    needs: [build, image, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        env:
+          RESULTS: ${{ needs.build.result }} ${{ needs.image.result }} ${{ needs.test.result }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a required CI job did not succeed"; exit 1 ;;
+            esac
+          done
+          echo "all CI jobs succeeded or were skipped"
