@@ -98,11 +98,6 @@ jobs:
           set -uo pipefail
           findings=$(grep -cE '^\|' trivy-scheduled.txt 2>/dev/null || echo 0)
 
-          # The label does not exist in a fresh repository, and gh refuses to
-          # create an issue with a label that is missing.
-          gh label create security --repo "$REPO" \
-            --color d73a4a --description "Security findings" 2>/dev/null || true
-
           title="Vulnerability scan: ${IMAGE}:${TAG}"
           existing=$(gh issue list --repo "$REPO" --label security --state open \
                       --search "$title in:title" --json number --jq '.[0].number' 2>/dev/null || true)
