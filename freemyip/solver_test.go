@@ -1,6 +1,11 @@
 package freemyip
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
@@ -65,5 +70,58 @@ func TestRecordNameIsNotTheBareDomain(t *testing.T) {
 	if got := recordName(&ch); got == ch.DNSName {
 		t.Fatalf("recordName() returned the bare domain %q; the TXT would be published "+
 			"one label above where ACME validation reads it", got)
+	}
+}
+
+// freemyip refuses calls made close together with "Requested token doesn't
+// exist" — throttling reported as an authentication failure. cert-manager
+// calls Present then CleanUp back to back, so without a retry the solver
+// fails on nearly every challenge, and the error blames the credential.
+func TestCallAPIRetriesThrottling(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			fmt.Fprint(w, "ERROR Requested token doesn't exist: abc123\n")
+			return
+		}
+		fmt.Fprint(w, "OK\nUpdated TXT for domain example.freemyip.com\n")
+	}))
+	defer srv.Close()
+
+	restore := freemyipAPIBase
+	freemyipAPIBase = srv.URL
+	defer func() { freemyipAPIBase = restore }()
+
+	if err := callAPI("abc123", "_acme-challenge.example.freemyip.com", "value"); err != nil {
+		t.Fatalf("callAPI should have recovered on the second attempt, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("expected 2 attempts, got %d", got)
+	}
+}
+
+// A genuinely bad token never starts working, so the error has to surface
+// rather than being retried away silently.
+func TestCallAPIGivesUp(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		fmt.Fprint(w, "ERROR something is permanently wrong\n")
+	}))
+	defer srv.Close()
+
+	restore := freemyipAPIBase
+	freemyipAPIBase = srv.URL
+	defer func() { freemyipAPIBase = restore }()
+
+	err := callAPI("abc123", "_acme-challenge.example.freemyip.com", "value")
+	if err == nil {
+		t.Fatal("expected an error after exhausting attempts")
+	}
+	if !strings.Contains(err.Error(), "permanently wrong") {
+		t.Errorf("the underlying response should survive in the error, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != apiAttempts {
+		t.Errorf("expected %d attempts, got %d", apiAttempts, got)
 	}
 }
