@@ -176,7 +176,7 @@ jobs:
         env:
           RESULTS: ${{ needs.zizmor.result }} ${{ needs.validate.result }}
         run: |
-          echo "zizmor=${{ needs.zizmor.result }} validate=${{ needs.validate.result }}"
+          echo "results: $RESULTS"
           for r in $RESULTS; do
             case "$r" in
               success|skipped) ;;

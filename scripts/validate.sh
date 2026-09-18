@@ -110,7 +110,10 @@ for f in "$WF"/*.y*ml; do
       inrun = 1; runind = ind; next
     }
     inrun && ind <= runind && NF > 0 { inrun = 0 }
-    inrun && /\$\{\{[[:space:]]*(github\.(actor|event|head_ref|ref_name)|secrets\.)/ {
+    # Any expansion, not a list of contexts. Naming contexts is how this
+    # missed ${{ needs.*.result }} in the status jobs, which zizmor caught
+    # and this did not.
+    inrun && /\$\{\{/ {
       printf "%s:%d:%s\n", F, NR, $0
     }
   ' "$f"

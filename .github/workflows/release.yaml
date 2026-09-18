@@ -452,20 +452,22 @@ jobs:
         with:
           egress-policy: audit
       - name: Check every gate and publish job
+        env:
+          # Through env, never interpolated into the shell: an expansion
+          # inside a run block is a code-injection sink.
+          REQUIRED: >-
+            ${{ needs.resolve.result }} ${{ needs.verify.result }}
+            ${{ needs.workflow_scan.result }}
+            ${{ needs.publish_image.result }} ${{ needs.publish_chart.result }}
+          SCAN: ${{ needs.scan.result }}
         run: |
-          echo "resolve=${{ needs.resolve.result }}"
-          echo "verify=${{ needs.verify.result }}"
-          echo "workflow_scan=${{ needs.workflow_scan.result }}"
-          echo "scan=${{ needs.scan.result }}"
-          echo "publish_image=${{ needs.publish_image.result }}"
-          echo "publish_chart=${{ needs.publish_chart.result }}"
-          # scan is the only one allowed to be skipped, via skip_security_scan.
-          for r in "${{ needs.resolve.result }}" "${{ needs.verify.result }}" \
-                   "${{ needs.workflow_scan.result }}" \
-                   "${{ needs.publish_image.result }}" "${{ needs.publish_chart.result }}"; do
+          echo "required: $REQUIRED"
+          echo "scan:     $SCAN"
+          for r in $REQUIRED; do
             [ "$r" = "success" ] || { echo "::error::release blocked: a required job did not succeed"; exit 1; }
           done
-          case "${{ needs.scan.result }}" in
+          # scan is the only one allowed to be skipped, via skip_security_scan.
+          case "$SCAN" in
             success|skipped) ;;
             *) echo "::error::release blocked: the vulnerability gate failed"; exit 1 ;;
           esac

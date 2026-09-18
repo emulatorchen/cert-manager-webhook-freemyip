@@ -156,7 +156,7 @@ jobs:
         env:
           RESULTS: ${{ needs.build.result }} ${{ needs.image.result }} ${{ needs.test.result }}
         run: |
-          echo "build=${{ needs.build.result }} image=${{ needs.image.result }} test=${{ needs.test.result }}"
+          echo "results: $RESULTS"
           for r in $RESULTS; do
             case "$r" in
               success|skipped) ;;

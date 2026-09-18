@@ -20,6 +20,11 @@ import (
 
 const (
 	freemyipAPIBase = "https://freemyip.com/update"
+
+	// What freemyip expects in txt to remove a record. An empty txt is not
+	// the same thing: the parameter is then treated as absent, which makes
+	// the call an IP update and returns ERROR.
+	clearTXTValue = "null"
 )
 
 // NewSolver returns a new freemyip DNS-01 solver.
@@ -74,8 +79,11 @@ func (s *freemyipSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
+	// clearTXTValue, not an empty string: freemyip answers ERROR to an empty
+	// txt, because an absent txt means "this is an IP update" rather than
+	// "remove the record". lego's provider sends the same literal.
 	klog.Infof("CleanUp: clearing TXT record for domain=%q", domain)
-	if err := callAPI(token, domain, ""); err != nil {
+	if err := callAPI(token, domain, clearTXTValue); err != nil {
 		return fmt.Errorf("cleanup TXT for %q: %w", ch.ResolvedFQDN, err)
 	}
 
