@@ -10,15 +10,29 @@ using the freemyip TXT-record API.
 ## How it works
 
 freemyip exposes a single HTTP endpoint that manages both A-records and TXT
-records for your registered domain:
+records for your registered domain.
+
+freemyip applies the update to whichever domain the token owns, publishing at
+`_acme-challenge.<that domain>` regardless of what `domain` says. The parameter
+is effectively ignored.
+
+That matters for one reason: **a token for the wrong domain fails silently.**
+freemyip answers `OK` and writes the record under its own domain, so the solver
+reports success while validation never finds the record. Each freemyip domain
+has its own token, so check the token matches the domain you are issuing for.
 
 ```
-# Set TXT record (Present)
-GET https://freemyip.com/update?token=TOKEN&domain=example.freemyip.com&txt=ACME_CHALLENGE
+GET https://freemyip.com/update
 
-# Clear TXT record (CleanUp)
-GET https://freemyip.com/update?token=TOKEN&domain=example.freemyip.com&txt=
+  token    your freemyip API token
+  domain   _acme-challenge.example.freemyip.com
+  txt      the challenge value to publish (Present),
+           or empty to clear the record (CleanUp)
 ```
+
+Sending `example.freemyip.com` instead publishes the record one label too high.
+freemyip accepts that and answers `OK`, so it looks like it worked, but no ACME
+validation can succeed.
 
 The webhook calls this endpoint in response to cert-manager's `Present` and
 `CleanUp` calls, allowing Let's Encrypt to verify `_acme-challenge.example.freemyip.com`.

@@ -33,8 +33,11 @@ func NewSolver() webhook.Solver {
 // freemyip exposes a single HTTP endpoint for both A-record updates and
 // TXT-record management:
 //
-//	Set TXT:   GET https://freemyip.com/update?token=TOKEN&domain=DOMAIN&txt=VALUE
-//	Clear TXT: GET https://freemyip.com/update?token=TOKEN&domain=DOMAIN&txt=
+// GET https://freemyip.com/update with three query parameters: the API token,
+// a domain, and txt. The record is written at exactly the name given as the
+// domain — freemyip does not prepend _acme-challenge itself — so the full
+// challenge FQDN goes there, e.g. _acme-challenge.example.freemyip.com.
+// An empty txt clears the record.
 type freemyipSolver struct {
 	client *kubernetes.Clientset
 }
@@ -116,11 +119,33 @@ func (s *freemyipSolver) credentialsFromChallenge(ch *v1alpha1.ChallengeRequest)
 	}
 	token = strings.TrimSpace(string(raw))
 
-	// ch.DNSName is the full hostname, e.g. "example.freemyip.com" for a
-	// non-wildcard cert, or "*.example.freemyip.com" for a wildcard cert.
-	// The freemyip TXT API takes the registered domain without the "*." prefix.
-	domain = strings.TrimPrefix(ch.DNSName, "*.")
-	return token, domain, nil
+	return token, recordName(ch), nil
+}
+
+// recordName returns the name sent as the domain parameter.
+//
+// Note that freemyip ignores it. The update endpoint applies the change to
+// whichever domain the token owns, publishing at _acme-challenge.<that
+// domain> regardless of what is asked for — verified against the live API,
+// where the certificate's domain and the full challenge FQDN both landed in
+// the same place within about ten seconds.
+//
+// A consequence worth knowing: pointing the solver at a domain the token does
+// not own fails silently. freemyip answers OK and writes the record under its
+// own domain instead, so Present succeeds, the record never appears where
+// validation reads, and nothing in the response says so.
+//
+// The full challenge FQDN is sent anyway, since it is what lego's provider
+// sends and it states the intent plainly. ResolvedFQDN is already
+// _acme-challenge.<domain>. for plain and wildcard certificates alike — which
+// is also why a wildcard and its apex collide here, sharing one TXT slot.
+func recordName(ch *v1alpha1.ChallengeRequest) string {
+	if fqdn := strings.TrimSuffix(ch.ResolvedFQDN, "."); fqdn != "" {
+		return fqdn
+	}
+	// ResolvedFQDN is always set by cert-manager; fall back rather than send
+	// an empty domain, which freemyip would reject.
+	return "_acme-challenge." + strings.TrimPrefix(ch.DNSName, "*.")
 }
 
 // callAPI calls the freemyip update endpoint.  Pass an empty txt to clear the

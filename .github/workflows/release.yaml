@@ -42,7 +42,10 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       ghcr_image: ${{ steps.v.outputs.ghcr_image }}
+      # Two forms on purpose: the registry wants docker.io/owner/name, the
+      # Docker Hub web API wants owner/name.
       hub_image: ${{ steps.v.outputs.hub_image }}
+      hub_repo: ${{ steps.v.outputs.hub_repo }}
       charts: ${{ steps.v.outputs.charts }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -76,7 +79,10 @@ jobs:
             echo "version=${version}"
             echo "tag=v${version}"
             echo "ghcr_image=ghcr.io/${GITHUB_REPOSITORY,,}"
-            echo "hub_image=${HUB_REPO}"
+            # Fully qualified for the registry and for attestation subjects,
+            # which reject a bare owner/name.
+            echo "hub_image=docker.io/${HUB_REPO}"
+            echo "hub_repo=${HUB_REPO}"
             echo "charts=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
           } >> "$GITHUB_OUTPUT"
           echo "Releasing ${version} to ghcr.io/${GITHUB_REPOSITORY,,} and ${HUB_REPO}"
@@ -119,8 +125,28 @@ jobs:
           go-version-file: go.mod
 
       # Reachability-aware: only reports advisories our code can actually call.
+      #
+      # The Go advisory database carries no severity, so this cannot be filtered
+      # the way the image scan can. It follows the same bar instead: at
+      # CRITICAL it reports and lets the release through, at CRITICAL,HIGH it
+      # blocks. Findings are always printed either way.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        env:
+          BLOCK: ${{ inputs.block_severity }}
+        run: |
+          if go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...; then
+            echo "no reachable vulnerabilities"
+          else
+            case "$BLOCK" in
+              *HIGH*)
+                echo "::error::govulncheck found reachable vulnerabilities and the bar is ${BLOCK}"
+                exit 1
+                ;;
+              *)
+                echo "::warning::govulncheck found reachable vulnerabilities — not blocking at the ${BLOCK} bar"
+                ;;
+            esac
+          fi
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build the release image locally for scanning
@@ -323,7 +349,9 @@ jobs:
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          # hub_repo, not hub_image: the Hub web API addresses repositories as
+          # owner/name, with no registry prefix.
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -uo pipefail
@@ -341,7 +369,7 @@ jobs:
           fi
           for tag in "$VERSION" latest; do
             code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-              "https://hub.docker.com/v2/repositories/${HUB_IMAGE}/tags/${tag}/" \
+              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${tag}/" \
               -H "Authorization: Bearer ${jwt}")
-            echo "delete ${HUB_IMAGE}:${tag} -> ${code}"
+            echo "delete ${HUB_REPO}:${tag} -> ${code}"
           done
