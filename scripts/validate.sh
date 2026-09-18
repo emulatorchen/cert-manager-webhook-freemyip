@@ -226,15 +226,30 @@ else
 fi
 
 # ── 14. zizmor — nothing at error level ──────────────────────────────────────
-head_ "zizmor"
+# BLOCK_SEVERITY follows the release workflow's input of the same name, so the
+# bar tightens in one place. CRITICAL blocks on zizmor's error level only;
+# CRITICAL,HIGH blocks on warnings too. Findings print either way, so the
+# softer setting reports everything and just does not fail the build.
+head_ "zizmor (blocking at ${BLOCK_SEVERITY:-CRITICAL})"
 if command -v zizmor >/dev/null 2>&1; then
   zizmor --format plain --no-online-audits "$WF" > /tmp/_zz.txt 2>&1
+
   if grep -qE '^error\[' /tmp/_zz.txt; then
     bad "error-level findings:"; grep -E '^error\[' /tmp/_zz.txt | sed 's/^/        /'
   else
     ok "no error-level findings"
   fi
-  grep -E '^warning\[' /tmp/_zz.txt | sed 's/^/        warn: /' || true
+
+  if grep -qE '^warning\[' /tmp/_zz.txt; then
+    case "${BLOCK_SEVERITY:-CRITICAL}" in
+      *HIGH*) bad "warning-level findings:" ;;
+      *)      echo "  warn  warning-level findings (not blocking at this bar):" ;;
+    esac
+    grep -E '^warning\[' /tmp/_zz.txt | sed 's/^/        /'
+  else
+    ok "no warning-level findings"
+  fi
+
   rm -f /tmp/_zz.txt
 else
   bad "zizmor not installed"

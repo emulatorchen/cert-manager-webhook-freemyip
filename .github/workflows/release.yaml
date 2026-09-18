@@ -108,6 +108,44 @@ jobs:
           helm template release-check charts/cert-manager-webhook-freemyip \
             --set image.tag="$VERSION" > /dev/null
 
+  # The workflows are part of the supply chain too: they hold the credentials
+  # and decide what gets published. Scanning the artifact but not the thing
+  # that publishes it leaves the more privileged half unchecked.
+  workflow_scan:
+    name: "Workflow security gate"
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Extracted onto PATH rather than installed system-wide: each tool is
+      # used by one step, so elevating for it buys nothing.
+      - name: Install actionlint v1.7.12 and zizmor v1.23.1
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/bin/"
+
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          mv zizmor "${RUNNER_TEMP}/bin/"
+
+          rm -f actionlint.tar.gz zizmor.tar.gz
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      - name: Scan the workflows
+        env:
+          BLOCK_SEVERITY: ${{ inputs.block_severity }}
+        run: ./scripts/validate.sh
+
   scan:
     name: "Vulnerability gate"
     needs: [resolve, verify]
@@ -190,11 +228,12 @@ jobs:
 
   publish_image:
     name: "Publish image"
-    needs: [resolve, verify, scan]
+    needs: [resolve, verify, workflow_scan, scan]
     if: |
       always() &&
       needs.resolve.result == 'success' &&
       needs.verify.result == 'success' &&
+      needs.workflow_scan.result == 'success' &&
       (needs.scan.result == 'success' || needs.scan.result == 'skipped')
     runs-on: ubuntu-latest
     environment: release
