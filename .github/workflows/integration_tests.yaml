@@ -36,6 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       # Fork pull requests get no secrets. Skip cleanly rather than fail.
       - name: Check configuration
         id: check
@@ -129,6 +132,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - name: Check configuration
         id: check
         env:
@@ -261,3 +267,28 @@ jobs:
       - name: Clean up the challenge record
         if: always() && steps.check.outputs.skip != 'true'
         run: kubectl delete certificate/e2e -n default --ignore-not-found || true
+
+  # One stable context for branch protection, so the ruleset does not have to
+  # name individual jobs. Skips count as success: the conformance tier skips
+  # cleanly on fork pull requests, and the staging tier only runs on dispatch.
+  integration_status:
+    name: "Integration status"
+    needs: [conformance, staging_certificate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check results
+        env:
+          RESULTS: ${{ needs.conformance.result }} ${{ needs.staging_certificate.result }}
+        run: |
+          echo "conformance=${{ needs.conformance.result }} staging=${{ needs.staging_certificate.result }}"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::an integration tier did not succeed"; exit 1 ;;
+            esac
+          done
+          echo "all integration tiers succeeded or were skipped"

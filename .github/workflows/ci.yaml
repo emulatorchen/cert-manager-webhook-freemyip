@@ -14,10 +14,46 @@ permissions:
   contents: read
 
 jobs:
+  # Skip the expensive jobs when a change cannot affect them. A push to main
+  # always runs everything, so main is never green on a stale skip.
+  changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            go:
+              - "**/*.go"
+              - "go.mod"
+              - "go.sum"
+            image:
+              - "Dockerfile"
+              - "**/*.go"
+              - "go.mod"
+              - "go.sum"
+
   build:
     name: "Build and vet"
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # Audits what the job talks to, so an action that starts reaching
+      # somewhere new is visible rather than silent.
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Do not leave the job token in .git/config where a later step or a
@@ -31,11 +67,16 @@ jobs:
 
   image:
     name: "Build image"
+    needs: changes
+    if: needs.changes.outputs.image == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -73,8 +114,13 @@ jobs:
 
   test:
     name: "Unit tests"
+    needs: changes
+    if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -96,3 +142,25 @@ jobs:
           else
             echo "::warning::govulncheck found reachable vulnerabilities — the release gate blocks on these at CRITICAL,HIGH"
           fi
+
+  # One stable context for branch protection to require. Without it the
+  # ruleset has to name every job, which silently stops enforcing anything the
+  # moment a job is renamed or a skip turns into a pass.
+  ci_status:
+    name: "CI status"
+    needs: [build, image, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        env:
+          RESULTS: ${{ needs.build.result }} ${{ needs.image.result }} ${{ needs.test.result }}
+        run: |
+          echo "build=${{ needs.build.result }} image=${{ needs.image.result }} test=${{ needs.test.result }}"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a required CI job did not succeed"; exit 1 ;;
+            esac
+          done
+          echo "all CI jobs succeeded or were skipped"

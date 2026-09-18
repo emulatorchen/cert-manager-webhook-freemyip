@@ -1,0 +1,137 @@
+name: scan-vulnerabilities
+
+# Advisories land after a release far more often than before one, so the
+# published image has to be rescanned on a schedule rather than only at build
+# time. docker-nginx-lego does the same, for the same reason.
+#
+# Reporting only: it opens an issue so the finding is visible, and never fails
+# a build. The release workflow is the only place that blocks.
+
+on:
+  schedule:
+    # Monday 06:00 UTC, ahead of the CodeQL and workflow-security sweeps.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Never two scans at once; a scheduled run and a manual one would only
+# duplicate the issue update.
+concurrency:
+  group: scan-vulnerabilities
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: "Scan the published image"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The latest release, not the working tree: this is about what people
+      # are actually running.
+      - name: Resolve the published image
+        id: img
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag=$(git tag --sort=-creatordate | head -1 | sed 's/^v//')
+          if [ -z "$tag" ]; then
+            echo "no release tag yet — nothing published to scan"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"     >> "$GITHUB_OUTPUT"
+          echo "scanning ${image}:${tag}"
+
+      - name: Scan
+        if: steps.img.outputs.skip != 'true'
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag }}
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-scheduled.sarif
+          exit-code: 0
+
+      - name: Upload results
+        if: always() && steps.img.outputs.skip != 'true'
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-scheduled.sarif
+          category: trivy-scheduled
+
+      # A table for humans, so the issue below says something useful rather
+      # than pointing at a SARIF file.
+      - name: Scan again for a readable summary
+        if: steps.img.outputs.skip != 'true'
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag }}
+          severity: CRITICAL,HIGH
+          format: table
+          output: trivy-scheduled.txt
+          exit-code: 0
+
+      # One issue, updated in place. A new issue every week for the same
+      # unfixed CVE is how people learn to ignore the scanner.
+      - name: Open or update the tracking issue
+        if: steps.img.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          IMAGE: ${{ steps.img.outputs.image }}
+          TAG: ${{ steps.img.outputs.tag }}
+        run: |
+          set -uo pipefail
+          findings=$(grep -cE '^\|' trivy-scheduled.txt 2>/dev/null || echo 0)
+
+          # The label does not exist in a fresh repository, and gh refuses to
+          # create an issue with a label that is missing.
+          gh label create security --repo "$REPO" \
+            --color d73a4a --description "Security findings" 2>/dev/null || true
+
+          title="Vulnerability scan: ${IMAGE}:${TAG}"
+          existing=$(gh issue list --repo "$REPO" --label security --state open \
+                      --search "$title in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+
+          if [ "$findings" -eq 0 ]; then
+            echo "no CRITICAL or HIGH findings"
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" \
+                --comment "No CRITICAL or HIGH findings in the latest scan." || true
+            fi
+            exit 0
+          fi
+
+          {
+            echo "Scheduled scan of the published image found CRITICAL or HIGH findings."
+            echo ""
+            echo "Image: \`${IMAGE}:${TAG}\`"
+            echo ""
+            echo '```'
+            head -100 trivy-scheduled.txt
+            echo '```'
+            echo ""
+            echo "Full results are in the security tab under \`trivy-scheduled\`."
+          } > /tmp/body.md
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file /tmp/body.md
+            echo "updated issue #${existing}"
+          else
+            gh issue create --repo "$REPO" --title "$title" \
+              --label security --body-file /tmp/body.md
+          fi

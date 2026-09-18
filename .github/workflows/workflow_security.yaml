@@ -30,6 +30,9 @@ jobs:
       security-events: write
       pull-requests: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
@@ -128,6 +131,9 @@ jobs:
     name: "Supply-chain rules"
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -155,3 +161,26 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
       - run: ./scripts/validate.sh
+
+  # Stable context for branch protection covering both analysis jobs.
+  workflow_security_status:
+    name: "Workflow security status"
+    needs: [zizmor, validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check results
+        env:
+          RESULTS: ${{ needs.zizmor.result }} ${{ needs.validate.result }}
+        run: |
+          echo "zizmor=${{ needs.zizmor.result }} validate=${{ needs.validate.result }}"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a workflow security job did not succeed"; exit 1 ;;
+            esac
+          done
+          echo "all workflow security jobs succeeded or were skipped"

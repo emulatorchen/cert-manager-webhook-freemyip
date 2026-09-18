@@ -1,0 +1,65 @@
+name: update-dockerhub-description
+
+# Docker Hub's repository page is the first thing most people see, and it goes
+# stale silently. This keeps it in step with the README.
+#
+# It needs DOCKERHUB_PASSWORD — the account password, not a PAT. Hub access
+# tokens return 403 against the Hub web API that serves the description, which
+# is a long-standing quirk rather than anything we can work around.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - ".github/workflows/update_dockerhub_description.yaml"
+  workflow_dispatch:
+
+# Serialise: two pushes in quick succession should not race to set the
+# description.
+concurrency:
+  group: dockerhub-description
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: "Update Docker Hub description"
+    runs-on: ubuntu-latest
+    # The account password lives behind the same reviewer gate as the publish
+    # credentials. It is the most powerful secret here: it can do anything the
+    # account can, not just push tags.
+    environment: release
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Skip rather than fail while the secret is unset, so this does not sit
+      # red on main before the password has been added.
+      - name: Check configuration
+        id: check
+        env:
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          if [ -z "$HUB_PW" ] || [ -z "$HUB_REPO" ]; then
+            echo "DOCKERHUB_PASSWORD or DOCKERHUB_REPOSITORY not set — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the README to Docker Hub
+        if: steps.check.outputs.skip != 'true'
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          "password": ${{ secrets.DOCKERHUB_PASSWORD }}
+          repository: ${{ vars.DOCKERHUB_REPOSITORY }}
+          readme-filepath: ./README.md
+          short-description: "cert-manager ACME DNS-01 webhook solver for freemyip.com"
