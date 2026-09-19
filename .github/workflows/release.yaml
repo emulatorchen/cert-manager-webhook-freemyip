@@ -3,6 +3,13 @@ name: release
 # Releases are started by a person, never by a ref appearing. Every job that
 # can publish declares environment: release, so it parks for a reviewer before
 # any credential is exposed to it.
+#
+# That gate is the supply-chain control, and it holds by construction:
+# GitHub's approval endpoint accepts only OAuth app tokens and classic PATs
+# with repo scope, and required reviewers can only be users or teams. GITHUB_TOKEN
+# is an App installation token and is not a reviewer, so no job in this workflow
+# — compromised or not — can approve its own deployment. Keep it that way: never
+# store a classic repo-scoped PAT belonging to a reviewer as a secret here.
 on:
   workflow_dispatch:
     inputs:
@@ -11,9 +18,13 @@ on:
         required: false
         default: ""
       notes:
-        description: "Release notes. Blank auto-generates them from merged pull requests."
+        description: "Release notes. Blank auto-generates them from merged pull requests; text is prepended before the generated notes unless override is checked."
         required: false
         default: ""
+      override_notes:
+        description: "Use only the notes above, discarding the auto-generated ones"
+        type: boolean
+        default: false
       block_severity:
         description: "Severities that block the release. Start at CRITICAL; tighten to CRITICAL,HIGH once the pipeline is proven."
         type: choice
@@ -38,6 +49,7 @@ jobs:
   resolve:
     name: "Resolve version"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -90,10 +102,99 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Releasing ${version} to ghcr.io/${GITHUB_REPOSITORY,,} and ${HUB_REPO}"
 
+  # Everything the reviewer should have read before pressing approve, in one
+  # place. Informational only — it never blocks. The blocking equivalents are
+  # workflow_scan and scan below.
+  security_preflight:
+    name: "Security preflight summary"
+    needs: resolve
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint v1.7.12 and zizmor v1.23.1
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/bin/"
+
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          mv zizmor "${RUNNER_TEMP}/bin/"
+
+          rm -f actionlint.tar.gz zizmor.tar.gz
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      - name: Run the analysers
+        run: |
+          zizmor --format plain --no-online-audits .github/workflows/ > /tmp/zizmor.txt 2>&1 || true
+          actionlint .github/workflows/*.y*ml > /tmp/actionlint.txt 2>&1 || true
+
+      - name: List open security issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue list --repo "$REPO" --label security --state open \
+            --json number,title --jq '.[] | "  #\(.number): \(.title)"' \
+            > /tmp/issues.txt 2>/dev/null || true
+
+      - name: Write the summary
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          {
+            echo "## Security preflight — ${VERSION}"
+            echo ""
+            echo "Read this before approving the release environment gate."
+            echo ""
+            echo "### Workflow static analysis (zizmor)"
+            if [ -s /tmp/zizmor.txt ]; then
+              echo '```'; cat /tmp/zizmor.txt; echo '```'
+            else
+              echo "No findings."
+            fi
+            echo ""
+            echo "### Workflow linting (actionlint)"
+            if [ -s /tmp/actionlint.txt ]; then
+              echo '```'; cat /tmp/actionlint.txt; echo '```'
+            else
+              echo "No findings."
+            fi
+            echo ""
+            echo "### Open security issues"
+            if [ -s /tmp/issues.txt ]; then
+              echo "Approving releases with these still open:"
+              echo '```'; cat /tmp/issues.txt; echo '```'
+            else
+              echo "None open."
+            fi
+            echo ""
+            echo "---"
+            echo "_Informational only. This job never blocks a release._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   verify:
     name: "Build and vet"
     needs: resolve
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -121,6 +222,7 @@ jobs:
     name: "Workflow security gate"
     needs: resolve
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -155,11 +257,153 @@ jobs:
           BLOCK_SEVERITY: ${{ inputs.block_severity }}
         run: ./scripts/validate.sh
 
+  # The release proves the thing it is about to publish actually works, in the
+  # run that publishes it — a real ACME order against Let's Encrypt staging,
+  # through kind, cert-manager and this chart. docker-nginx-lego gates all of
+  # its publishes on the same check.
+  #
+  # Job-level concurrency, not workflow-level: freemyip stores exactly one TXT
+  # value per domain, so this must never run beside the integration-tests
+  # workflow, which shares this group.
+  integration_check:
+    name: "Integration test (DNS-01 staging certificate)"
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: freemyip-dns
+      cancel-in-progress: false
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Check configuration
+        id: check
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$DOMAIN" ] || [ -z "$EMAIL" ]; then
+            echo "::error::FREEMYIP_TOKEN, FREEMYIP_DOMAIN or CERTBOT_EMAIL is missing — a release must not publish untested"
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the webhook image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          tags: webhook:release-check
+
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: release-check
+
+      - name: Install cert-manager and the webhook
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          set -euo pipefail
+          kind load docker-image webhook:release-check --name release-check
+
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update jetstack
+
+          # cert-manager checks the record itself before asking Let's Encrypt to,
+          # by default against the zone's authoritative nameservers. From inside
+          # kind on a runner that lookup does not complete, so the challenge sits
+          # pending until the order expires. Pin the self-check to recursive
+          # resolvers reachable over the path that works.
+          cat > /tmp/cm-values.yaml <<'EOF'
+          crds:
+            enabled: true
+          extraArgs:
+            - --dns01-recursive-nameservers-only
+            - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
+          EOF
+
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            -f /tmp/cm-values.yaml \
+            --wait --timeout 10m
+
+          # A values file rather than --set: the token never reaches the process
+          # list, where anything on the runner could read it.
+          umask 077
+          cat > /tmp/values.yaml <<EOF
+          image:
+            repository: webhook
+            tag: release-check
+            pullPolicy: Never
+          freemyip:
+            "token": "${TOKEN}"
+          clusterIssuer:
+            email: "${EMAIL}"
+            staging:
+              create: true
+          EOF
+
+          helm upgrade --install cert-manager-webhook-freemyip \
+            charts/cert-manager-webhook-freemyip \
+            --namespace cert-manager \
+            -f /tmp/values.yaml \
+            --wait --timeout 5m
+          rm -f /tmp/values.yaml
+
+      - name: Request a staging certificate
+        env:
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+        run: |
+          set -euo pipefail
+          # One DNS name only: freemyip stores a single TXT value per domain.
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: release-check
+            namespace: default
+          spec:
+            secretName: release-check-tls
+            issuerRef:
+              name: cert-manager-webhook-freemyip-staging
+              kind: ClusterIssuer
+            dnsNames:
+              - ${DOMAIN}
+          EOF
+          kubectl wait --for=condition=Ready certificate/release-check -n default --timeout=8m
+
+      - name: Show what happened on failure
+        if: failure()
+        run: |
+          kubectl describe certificate/release-check -n default || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          kubectl describe order -A || true
+          kubectl logs -n cert-manager -l app.kubernetes.io/name=cert-manager-webhook-freemyip --tail=200 || true
+          kubectl logs -n cert-manager -l app=cert-manager --tail=200 || true
+
+      - name: Clean up the challenge record
+        if: always()
+        run: kubectl delete certificate/release-check -n default --ignore-not-found || true
+
   scan:
     name: "Vulnerability gate"
-    needs: [resolve, verify]
+    needs: [resolve, verify, integration_check]
     if: ${{ !inputs.skip_security_scan }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
@@ -206,6 +450,9 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
+          # Force a fresh base pull, so the thing scanned here is the thing the
+          # publish job builds rather than a cached layer.
+          pull: true
           tags: scan-target:release
 
       # Two passes, deliberately. The first is the gate and is the only one
@@ -213,11 +460,17 @@ jobs:
       # from CRITICAL to CRITICAL,HIGH without editing this file. The second
       # always records the full CRITICAL,HIGH picture to the security tab, so
       # raising the bar later is an informed decision rather than a guess.
+      #
+      # ignore-unfixed: a CVE with no upstream fix cannot be acted on, and
+      # blocking on it means the gate can never be tightened. Accepting one
+      # deliberately is what .trivyignore is for.
       - name: Vulnerability gate
         uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
         with:
           scan-ref: scan-target:release
           severity: ${{ inputs.block_severity }}
+          ignore-unfixed: true
+          trivyignores: .trivyignore
           format: table
           exit-code: 1
 
@@ -227,6 +480,7 @@ jobs:
         with:
           scan-ref: scan-target:release
           severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
           format: sarif
           output: trivy-release.sarif
           exit-code: 0
@@ -240,14 +494,17 @@ jobs:
 
   publish_image:
     name: "Publish image"
-    needs: [resolve, verify, workflow_scan, scan]
+    needs: [resolve, security_preflight, verify, workflow_scan, integration_check, scan]
     if: |
       always() &&
       needs.resolve.result == 'success' &&
       needs.verify.result == 'success' &&
       needs.workflow_scan.result == 'success' &&
+      needs.integration_check.result == 'success' &&
+      (needs.security_preflight.result == 'success' || needs.security_preflight.result == 'skipped') &&
       (needs.scan.result == 'success' || needs.scan.result == 'skipped')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: release
     permissions:
       contents: read
@@ -262,6 +519,18 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
+
+      - name: Log dependency results
+        env:
+          RESULTS: >-
+            resolve=${{ needs.resolve.result }}
+            verify=${{ needs.verify.result }}
+            workflow_scan=${{ needs.workflow_scan.result }}
+            integration=${{ needs.integration_check.result }}
+            preflight=${{ needs.security_preflight.result }}
+            scan=${{ needs.scan.result }}
+        run: echo "$RESULTS"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -283,6 +552,8 @@ jobs:
         run: printf '%s' "$HUB_PAT" | docker login docker.io -u "$HUB_USER" --password-stdin
 
       # latest moves only here, in a reviewer-gated release — never from CI.
+      # pull + no-cache: a published image is built from scratch against a
+      # freshly pulled base, never from a layer cache of unknown age.
       - name: Build and push
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -290,6 +561,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          pull: true
+          no-cache: true
           provenance: mode=max
           sbom: true
           tags: |
@@ -316,9 +589,10 @@ jobs:
     name: "Publish chart"
     needs: [resolve, publish_image]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -326,9 +600,10 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Package and push the chart
+      - name: Package and push the chart to the OCI registry
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
@@ -341,6 +616,31 @@ jobs:
             --app-version "$VERSION"
           helm push "cert-manager-webhook-freemyip-${VERSION}.tgz" "$CHARTS"
 
+      # The OCI registry above is private until the package is made public by
+      # hand, so it cannot be the only route. A GitHub Pages chart repo is
+      # public the moment it exists and is what `helm repo add` expects.
+      #
+      # Skipped until the gh-pages branch exists, so the release does not fail
+      # on a repository that has not been set up for Pages yet.
+      - name: Check for the gh-pages branch
+        id: pages
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no gh-pages branch — skipping the Helm repository publish. Create it and enable GitHub Pages to serve the chart over helm repo add."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to the GitHub Pages chart repository
+        if: steps.pages.outputs.present == 'true'
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          charts_dir: charts
+          skip_existing: true
+
       - name: Keep the packaged chart for the release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -348,13 +648,53 @@ jobs:
           path: cert-manager-webhook-freemyip-*.tgz
           if-no-files-found: error
 
+  # Aggregate every gate and publish job before the release is announced, so a
+  # partial publish never gets a GitHub release attached to it.
+  release_gate:
+    name: "Release gate"
+    needs: [resolve, security_preflight, verify, workflow_scan, integration_check, scan, publish_image, publish_chart]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check every gate and publish job
+        env:
+          # Through env, never interpolated into the shell: an expansion
+          # inside a run block is a code-injection sink.
+          REQUIRED: >-
+            ${{ needs.resolve.result }} ${{ needs.verify.result }}
+            ${{ needs.workflow_scan.result }} ${{ needs.integration_check.result }}
+            ${{ needs.publish_image.result }} ${{ needs.publish_chart.result }}
+          OPTIONAL: >-
+            ${{ needs.scan.result }} ${{ needs.security_preflight.result }}
+        run: |
+          echo "required: $REQUIRED"
+          echo "optional: $OPTIONAL"
+          for r in $REQUIRED; do
+            [ "$r" = "success" ] || { echo "::error::release blocked: a required job did not succeed"; exit 1; }
+          done
+          # These two are the only jobs allowed to be skipped: scan via
+          # skip_security_scan, and the preflight because it never blocks.
+          for r in $OPTIONAL; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::release blocked: a gate job failed"; exit 1 ;;
+            esac
+          done
+          echo "all gates passed"
+
   github_release:
     name: "Create GitHub release"
     # Behind release_gate rather than the publish jobs directly, so the
     # release is only announced once every gate and both publishes have been
     # confirmed together.
     needs: [resolve, release_gate]
+    if: always() && needs.release_gate.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     permissions:
       contents: write
@@ -376,20 +716,50 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           TAG: ${{ needs.resolve.outputs.tag }}
           NOTES: ${{ inputs.notes }}
+          OVERRIDE: ${{ inputs.override_notes }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NOTES" ]; then
+            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
+              cert-manager-webhook-freemyip-*.tgz
+          elif [ "$OVERRIDE" = "true" ]; then
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --latest \
+              cert-manager-webhook-freemyip-*.tgz
+          else
+            # Prepend the supplied text to the generated notes, rather than
+            # making the author choose between context and a changelog.
+            prev=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1)
+            generated=""
+            if [ -n "$prev" ]; then
+              generated=$(gh api "repos/${REPO}/releases/generate-notes" \
+                -f tag_name="$TAG" -f previous_tag_name="$prev" --jq '.body' || true)
+            fi
+            body="$NOTES"
+            [ -n "$generated" ] && body="${body}"$'\n\n'"${generated}"
+            gh release create "$TAG" --title "$TAG" --notes "$body" --latest \
+              cert-manager-webhook-freemyip-*.tgz
+          fi
+
+      # The Docker Hub page is deliberately NOT refreshed here.
+      #
+      # Updating it needs the Docker Hub account password, not a registry token:
+      # hub.docker.com/v2 returns 403 for access tokens. That password is the
+      # strongest credential this project holds — it can delete repositories and
+      # mint new tokens — so it lives in its own environment, dockerhub-metadata,
+      # readable only by update_dockerhub_description.yaml. A job can declare
+      # exactly one environment, and this one needs `release`, so keeping the
+      # refresh here would mean putting the account password alongside the
+      # publish credentials. Isolation wins over the convenience.
+      - name: Summarise
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          set -euo pipefail
-          if [ -n "$NOTES" ]; then
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          else
-            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          fi
           {
             echo "### Released ${TAG}"
             echo ""
@@ -398,18 +768,174 @@ jobs:
             echo "- chart \`${VERSION}\` pushed to the ghcr OCI registry"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  cleanup_on_cancel:
-    name: "⚠️ Approve to DELETE partially published tags — NOT a release"
-    needs: [resolve]
-    if: cancelled()
+  # The Docker Hub page refreshed as part of the release, but through a called
+  # workflow whose job declares environment: dockerhub-metadata. Environment
+  # scoping is per job, so that job reads the account password and no other job
+  # in this run — publish_image and github_release included — can reach it.
+  #
+  # Only DOCKERHUB_USERNAME is handed over, explicitly rather than by
+  # `secrets: inherit`, so the callee receives one value and nothing else.
+  dockerhub_description:
+    name: "Refresh the Docker Hub page"
+    needs: [resolve, release_gate, github_release]
+    if: always() && needs.github_release.result == 'success'
+    uses: ./.github/workflows/update_dockerhub_description.yaml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+  # Scan what was actually published, not what was built. The image on the
+  # registry is the one people pull, and advisories land after a release as
+  # often as before one.
+  post_release_report:
+    name: "Post-release vulnerability report"
+    needs: [resolve, release_gate, github_release]
+    if: always() && needs.github_release.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan the released image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-released.sarif
+          exit-code: 0
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-released.sarif
+          category: trivy-released
+
+      - name: Scan again as JSON for triage
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+          format: json
+          output: trivy-released.json
+          exit-code: 0
+
+      # One issue per CVE, not one issue listing them all: a lumped issue is
+      # never closed cleanly and stops being read. Matches how
+      # docker-nginx-lego tracks them.
+      - name: Open or update an issue per CVE
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -uo pipefail
+          today=$(date +%Y-%m-%d)
+
+          cves=$(jq -r '.Results[]?.Vulnerabilities[]? |
+            select(.Severity == "CRITICAL" or .Severity == "HIGH") |
+            .VulnerabilityID' trivy-released.json 2>/dev/null | sort -u)
+
+          if [ -z "$cves" ]; then
+            echo "No CRITICAL or HIGH findings in the released image." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          open_issues=$(gh issue list --repo "$REPO" --label security --state open \
+            --json number,title --limit 100 2>/dev/null || echo "[]")
+
+          echo "$cves" | while read -r cve; do
+            [ -z "$cve" ] && continue
+            row=$(jq -r --arg cve "$cve" '
+              .Results[]?.Vulnerabilities[]? |
+              select(.VulnerabilityID == $cve) |
+              "\(.Severity)\t\(.PkgName)\t\(.FixedVersion // "unknown")"
+            ' trivy-released.json | head -1)
+            [ -z "$row" ] && continue
+            severity=$(printf '%s' "$row" | cut -f1)
+            pkg=$(printf '%s' "$row" | cut -f2)
+            fixed=$(printf '%s' "$row" | cut -f3)
+
+            labels="security,severity:$(printf '%s' "$severity" | tr '[:upper:]' '[:lower:]')"
+            [ "$fixed" = "unknown" ] && labels="${labels},no-fix-available"
+
+            existing=$(printf '%s' "$open_issues" | jq -r --arg cve "$cve" \
+              '.[] | select(.title | contains($cve)) | .number' | head -1)
+
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" \
+                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`."
+            else
+              body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**Detected in release:** `%s`\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
+                "$cve" "$severity" "$pkg" "$fixed" "$TAG" "$cve")
+              gh issue create --repo "$REPO" \
+                --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
+                --body "$body" --label "$labels"
+            fi
+          done
+
+  # Ungated on purpose, and it runs before the deletion job. A reviewer facing
+  # an approval prompt after a failed release needs to know that approving
+  # deletes tags rather than publishing anything.
+  cleanup_notice:
+    name: "Pending: approve to delete partially published tags"
+    needs: [resolve, publish_image, publish_chart]
+    if: always() && needs.resolve.result == 'success' && (failure() || cancelled())
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Explain the pending approval
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+        run: |
+          {
+            echo "## Action required: approve Docker Hub tag deletion"
+            echo ""
+            echo "The release failed or was cancelled part-way through."
+            echo ""
+            echo "**The next approval DELETEs only the tags this run pushed. It is not a new release attempt.**"
+            echo ""
+            echo "Tags that will be deleted from \`${HUB_REPO}\` if they exist:"
+            echo ""
+            echo "- \`${VERSION}\`"
+            echo "- \`latest\`"
+            echo ""
+            echo "No git tag was created — this workflow creates it last, with the GitHub release — so"
+            echo "there is nothing to unwind on the repository side."
+            echo ""
+            echo "Review deployments → release → Approve and deploy, to proceed with deletion."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup_dockerhub:
+    name: "⚠️ Approve to DELETE partially published tags — NOT a release"
+    needs: [resolve, cleanup_notice]
+    if: always() && needs.cleanup_notice.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: release
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      # Docker Hub publishes tag by tag, so a cancel mid-push can leave a
-      # half-released version behind. ghcr is not cleaned up here: its
+      # Docker Hub publishes tag by tag, so a cancel or a failure mid-push can
+      # leave a half-released version behind. ghcr is not cleaned up here: its
       # versioned tags are overwritable, so a retry corrects them.
       - name: Delete the tags this run may have pushed
         env:
@@ -439,88 +965,3 @@ jobs:
               -H "Authorization: Bearer ${jwt}")
             echo "delete ${HUB_REPO}:${tag} -> ${code}"
           done
-
-  # Aggregate the publish jobs before the release is announced, so a partial
-  # publish does not get a GitHub release attached to it.
-  release_gate:
-    name: "Release gate"
-    needs: [resolve, verify, workflow_scan, scan, publish_image, publish_chart]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-      - name: Check every gate and publish job
-        env:
-          # Through env, never interpolated into the shell: an expansion
-          # inside a run block is a code-injection sink.
-          REQUIRED: >-
-            ${{ needs.resolve.result }} ${{ needs.verify.result }}
-            ${{ needs.workflow_scan.result }}
-            ${{ needs.publish_image.result }} ${{ needs.publish_chart.result }}
-          SCAN: ${{ needs.scan.result }}
-        run: |
-          echo "required: $REQUIRED"
-          echo "scan:     $SCAN"
-          for r in $REQUIRED; do
-            [ "$r" = "success" ] || { echo "::error::release blocked: a required job did not succeed"; exit 1; }
-          done
-          # scan is the only one allowed to be skipped, via skip_security_scan.
-          case "$SCAN" in
-            success|skipped) ;;
-            *) echo "::error::release blocked: the vulnerability gate failed"; exit 1 ;;
-          esac
-          echo "all gates passed"
-
-  # Scan what was actually published, not what was built. The image on the
-  # registry is the one people pull, and advisories land after a release as
-  # often as before one.
-  post_release_report:
-    name: "Post-release vulnerability report"
-    needs: [resolve, release_gate, github_release]
-    if: always() && needs.github_release.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-      issues: write
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Scan the released image
-        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
-        with:
-          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-          severity: CRITICAL,HIGH
-          format: sarif
-          output: trivy-released.sarif
-          exit-code: 0
-
-      - name: Upload scan results
-        if: always()
-        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
-        with:
-          sarif_file: trivy-released.sarif
-          category: trivy-released
-
-      - name: Summarise
-        env:
-          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
-          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          {
-            echo "### Released ${VERSION}"
-            echo ""
-            echo "- \`${GHCR_IMAGE}:${VERSION}\`"
-            echo "- \`${HUB_IMAGE}:${VERSION}\`"
-            echo ""
-            echo "Scan results for the published image are in the security tab"
-            echo "under the \`trivy-released\` category."
-          } >> "$GITHUB_STEP_SUMMARY"
