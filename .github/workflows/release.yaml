@@ -255,6 +255,9 @@ jobs:
       - name: Scan the workflows
         env:
           BLOCK_SEVERITY: ${{ inputs.block_severity }}
+          # Needed for the pin-versus-tag check; without it that check skips and
+          # a SHA pinned to the wrong version would sail through the gate.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/validate.sh
 
   # The release proves the thing it is about to publish actually works, in the
@@ -842,6 +845,10 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
+          # SC2016: the single-quoted blocks below are jq programs, and $cve is a
+          # jq variable bound with --arg. Shell expansion is exactly what must
+          # not happen there.
+          # shellcheck disable=SC2016
           set -uo pipefail
           today=$(date +%Y-%m-%d)
 
