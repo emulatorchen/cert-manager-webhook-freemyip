@@ -848,7 +848,6 @@ jobs:
           # SC2016: the single-quoted blocks below are jq programs, and $cve is a
           # jq variable bound with --arg. Shell expansion is exactly what must
           # not happen there.
-          # shellcheck disable=SC2016
           set -uo pipefail
           today=$(date +%Y-%m-%d)
 

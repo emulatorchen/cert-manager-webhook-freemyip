@@ -1,0 +1,19 @@
+# actionlint configuration.
+#
+# actionlint runs shellcheck over every `run:` block. SC2016 — "expressions
+# don't expand in single quotes" — fires on the jq and awk programs these
+# workflows are built around, where a $-prefixed name is a jq variable bound
+# with --arg or an awk variable bound with -v, not a shell variable. Shell
+# expansion there is exactly what must not happen, so every occurrence is a
+# false positive.
+#
+# It is suppressed here rather than with inline `# shellcheck disable`
+# directives, which actionlint does not honour inside a run: block.
+#
+# Nothing else is suppressed. SC2086 (unquoted expansion), SC2046 (word
+# splitting on command substitution) and the rest still fail the build, and so
+# does every actionlint rule of its own.
+paths:
+  .github/workflows/**:
+    ignore:
+      - 'shellcheck reported issue in this script: SC2016'
