@@ -80,16 +80,20 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       # No registry login and push: false — a pull_request job must never hold
-      # publish capability. load: true keeps the image for the scan below.
+      # publish capability. load: true keeps the image for the scan below, and
+      # only works for a single platform, which is why the multi-arch check is
+      # a second build.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
           load: true
           push: false
+          pull: true
           tags: scan-target:ci
 
       # Reporting, not gating. The release workflow is where the blocking
@@ -101,6 +105,7 @@ jobs:
         with:
           scan-ref: scan-target:ci
           severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
           format: sarif
           output: trivy-ci.sarif
           exit-code: 0
@@ -111,6 +116,19 @@ jobs:
         with:
           sarif_file: trivy-ci.sarif
           category: trivy-ci
+
+      # Every platform the release publishes, built here at push: false. Without
+      # this, linux/arm64 is compiled for the first time during the release
+      # itself — the one run where a build failure is most expensive.
+      # docker-nginx-lego validates all its target platforms on every pull
+      # request for the same reason.
+      - name: Build every published platform
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          pull: true
 
   test:
     name: "Unit tests"

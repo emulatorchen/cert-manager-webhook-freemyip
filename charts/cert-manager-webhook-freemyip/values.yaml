@@ -21,7 +21,12 @@ clusterIssuer:
     create: false
 
 image:
-  repository: ghcr.io/emulatorchen/cert-manager-webhook-freemyip
+  # Docker Hub, not ghcr. A ghcr package created by a workflow push is private
+  # until someone makes it public by hand, so a chart defaulting there cannot
+  # pull its own image on a fresh install. Docker Hub is public on creation.
+  # The same image is published to ghcr.io/emulatorchen/cert-manager-webhook-freemyip
+  # for anyone who prefers it.
+  repository: docker.io/emulator/cert-manager-webhook-freemyip
   # Defaults to the chart appVersion when empty.
   tag: ""
   pullPolicy: IfNotPresent

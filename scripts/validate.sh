@@ -157,10 +157,14 @@ done
 # ── 10. cancellation cleanup for non-atomic registries ───────────────────────
 # Docker Hub publishes tag by tag, so a cancel mid-run leaves a half-released
 # version behind. Something has to clean that up.
+#
+# The condition is matched loosely because a failure part-way through the push
+# strands tags exactly as a cancel does, so the guard is failure() ||
+# cancelled() — the docker-nginx-lego form — not cancelled() alone.
 head_ "Rule 6 — cancellation cleanup present"
 for f in "$WF"/release.y*ml; do
   [ -e "$f" ] || continue
-  grep -qE 'if:[[:space:]]*cancelled\(\)' "$f" \
+  grep -qE 'if:.*cancelled\(\)' "$f" \
     && ok "$(basename "$f"): has a cancelled() cleanup job" \
     || bad "$(basename "$f"): no cancelled() cleanup job"
 done
@@ -177,10 +181,17 @@ for f in "$WF"/release.y*ml; do
   fi
 done
 
-# ── 12. Docker Hub credentials only inside release-gated jobs ────────────────
+# ── 12. Docker Hub credentials only inside environment-gated jobs ────────────
 # Only credentials are gated. A repository variable holding the Docker Hub
 # repository name is not one, so this matches secrets.DOCKERHUB* specifically.
-head_ "Rule 4 — Docker Hub credentials only in release-gated jobs"
+#
+# Two environments are allowed, and they are not interchangeable:
+#   release            — the registry token, which can push and delete tags.
+#   dockerhub-metadata — the account password, which the Hub web API demands
+#                        for the description and which can do anything the
+#                        account can. It is deliberately NOT in `release`, so
+#                        no publishing job can read it.
+head_ "Rule 4 — Docker Hub credentials only in environment-gated jobs"
 for f in "$WF"/*.y*ml; do
   grep -qE 'secrets\.DOCKERHUB' "$f" || continue
   awk -v F="$(basename "$f")" '
@@ -189,15 +200,66 @@ for f in "$WF"/*.y*ml; do
     injobs {body = body $0 "\n"}
     END {if (job!="") flush()}
     function flush() {
-      if (body ~ /secrets\.DOCKERHUB/) {
-        if (body ~ /environment:[[:space:]]*release/) printf "  ok    %s:%s gated\n", F, job
-        else                                          printf "  FAIL  %s:%s uses Docker Hub outside environment: release\n", F, job
+      if (body !~ /secrets\.DOCKERHUB/) return
+      # A job that calls a local reusable workflow cannot declare an
+      # environment — the callee does. Passing the username on is fine; passing
+      # a write-capable credential is not, and the callee could not use it
+      # anyway, because an environment secret always beats a passed one.
+      if (body ~ /uses:[[:space:]]*\.\/\.github\/workflows\//) {
+        if (body ~ /secrets\.DOCKERHUB_(PASSWORD|RELEASE_TOKEN):/) {
+          printf "  FAIL  %s:%s passes a write-capable Docker Hub credential into a called workflow\n", F, job
+        } else {
+          printf "  ok    %s:%s calls a reusable workflow; the environment is declared there\n", F, job
+        }
+        return
       }
+      gated = (body ~ /environment:[[:space:]]*(release|dockerhub-metadata)/)
+      if (!gated) {
+        printf "  FAIL  %s:%s uses Docker Hub credentials outside a gated environment\n", F, job
+        return
+      }
+      # The account password is strictly narrower than the rest: only the
+      # metadata environment may hold it.
+      if (body ~ /secrets\.DOCKERHUB_PASSWORD/ && body !~ /environment:[[:space:]]*dockerhub-metadata/) {
+        printf "  FAIL  %s:%s reads DOCKERHUB_PASSWORD outside environment: dockerhub-metadata\n", F, job
+        return
+      }
+      printf "  ok    %s:%s gated\n", F, job
     }
   ' "$f"
 done > /tmp/_dh.txt
 [ -s /tmp/_dh.txt ] && cat /tmp/_dh.txt || echo "  ok    no Docker Hub usage found"
 grep -q FAIL /tmp/_dh.txt && FAIL=1; rm -f /tmp/_dh.txt
+
+# ── 12b. every non-GITHUB_TOKEN secret sits behind an environment ────────────
+# A workflow_dispatch can be started from any ref by anyone with write access,
+# so a repository secret used by an ungated job is readable by whatever code
+# that branch happens to contain. An environment with a branch policy is the
+# only thing that stops it.
+#
+# FREEMYIP_TOKEN and CERTBOT_EMAIL are the deliberate exceptions: they have to
+# be reachable from pull request jobs, and neither can publish anything — the
+# token writes one TXT record, the address registers with Let's Encrypt staging.
+head_ "Secrets other than GITHUB_TOKEN are environment-gated"
+for f in "$WF"/*.y*ml; do
+  grep -qE 'secrets\.[A-Z_]+' "$f" || continue
+  awk -v F="$(basename "$f")" '
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=""; next }
+    injobs {body = body $0 "\n"}
+    END {if (job!="") flush()}
+    function flush(  tmp) {
+      tmp = body
+      gsub(/secrets\.(GITHUB_TOKEN|FREEMYIP_TOKEN|CERTBOT_EMAIL|DOCKERHUB_USERNAME)/, "", tmp)
+      if (tmp !~ /secrets\.[A-Z_]+/) return
+      if (body ~ /uses:[[:space:]]*\.\/\.github\/workflows\//) return
+      if (body ~ /environment:[[:space:]]*[a-z-]+/) printf "  ok    %s:%s gated\n", F, job
+      else                                          printf "  FAIL  %s:%s reads a privileged secret without an environment\n", F, job
+    }
+  ' "$f"
+done > /tmp/_sec.txt
+[ -s /tmp/_sec.txt ] && cat /tmp/_sec.txt || echo "  ok    no privileged secrets outside GITHUB_TOKEN"
+grep -q FAIL /tmp/_sec.txt && FAIL=1; rm -f /tmp/_sec.txt
 
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable

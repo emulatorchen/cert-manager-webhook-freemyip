@@ -59,19 +59,48 @@ IMAGE_REGISTRY=ghcr.io/emulatorchen IMAGE_TAG=0.1.0 make docker-push
 ## Install
 
 ```bash
-# Clone the repo onto the machine where you run Helm
-git clone https://github.com/emulatorchen/cert-manager-webhook-freemyip.git
+helm repo add cert-manager-webhook-freemyip \
+  https://emulatorchen.github.io/cert-manager-webhook-freemyip
+helm repo update
 
-# Install the Helm chart into the cert-manager namespace
+cat > values.yaml <<'EOF'
+clusterIssuer:
+  email: you@example.com
+  staging:
+    create: true
+  production:
+    create: true
+EOF
+
 helm upgrade --install cert-manager-webhook-freemyip \
-  --namespace cert-manager \
-  --set freemyip.token='YOUR_TOKEN' \
-  --set clusterIssuer.production.create=true \
-  --set clusterIssuer.staging.create=true \
-  --set clusterIssuer.email='you@example.com' \
-  --set image.repository=ghcr.io/emulatorchen/cert-manager-webhook-freemyip \
-  --set image.tag=0.1.0 \
-  ./charts/cert-manager-webhook-freemyip
+  cert-manager-webhook-freemyip/cert-manager-webhook-freemyip \
+  --namespace cert-manager -f values.yaml
+```
+
+Supply the freemyip API key one of two ways. Either set `freemyip.token` in that
+values file and let the chart create the Secret, or create the Secret yourself in
+the `cert-manager` namespace with a single key named `token`, then point the
+chart at it with `secret.existingSecret` and `secret.existingSecretName`. The
+second keeps the key out of the values file and out of your shell history.
+
+Use a values file rather than `--set` either way: anything on the command line is
+visible in the process list to every other user on the machine.
+
+The chart defaults to `docker.io/emulator/cert-manager-webhook-freemyip` at the
+chart's `appVersion`, so no image override is needed. The same image is published
+to `ghcr.io/emulatorchen/cert-manager-webhook-freemyip` for anyone who prefers it:
+
+```bash
+  --set image.repository=ghcr.io/emulatorchen/cert-manager-webhook-freemyip
+```
+
+The chart is also published as an OCI artifact, and as a `.tgz` attached to each
+GitHub release:
+
+```bash
+helm upgrade --install cert-manager-webhook-freemyip \
+  oci://ghcr.io/emulatorchen/charts/cert-manager-webhook-freemyip \
+  --version 0.1.0 --namespace cert-manager
 ```
 
 ## Usage
@@ -100,8 +129,8 @@ spec:
 | `clusterIssuer.email` | `name@example.com` | Email for Let's Encrypt registration |
 | `clusterIssuer.production.create` | `false` | Create the production ClusterIssuer |
 | `clusterIssuer.staging.create` | `false` | Create the staging ClusterIssuer |
-| `image.repository` | `ghcr.io/emulatorchen/cert-manager-webhook-freemyip` | Image registry path |
-| `image.tag` | `0.1.0` | Image tag |
+| `image.repository` | `docker.io/emulator/cert-manager-webhook-freemyip` | Image registry path |
+| `image.tag` | `""` | Image tag; empty uses the chart `appVersion` |
 | `groupName` | `acme.freemyip.emulatorchen.github.com` | Webhook group name (must be unique) |
 
 ## License

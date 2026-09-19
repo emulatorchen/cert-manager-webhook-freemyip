@@ -160,7 +160,13 @@ jobs:
           rm -f zizmor.tar.gz
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
-      - run: ./scripts/validate.sh
+      # validate.sh checks each pinned SHA against the version its comment
+      # claims, which needs an authenticated gh. Without this the check reports
+      # "skip" and a pin that names the wrong version passes unnoticed — the
+      # failure mode it exists to catch.
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/validate.sh
 
   # Stable context for branch protection covering both analysis jobs.
   workflow_security_status:
