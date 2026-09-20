@@ -1,20 +1,25 @@
 name: scan-vulnerabilities
 
-# Advisories land after a release far more often than before one, so the
-# published image has to be rescanned on a schedule rather than only at build
-# time. docker-nginx-lego does the same, for the same reason.
+# Advisories land after a release far more often than before one, so the image
+# has to be rescanned on a schedule rather than only at build time.
+# docker-nginx-lego does the same, for the same reason.
 #
-# Reporting only: it opens an issue so the finding is visible, and never fails
-# a build. The release workflow is the only place that blocks.
+# This scans a fresh build from the Dockerfile rather than the published image:
+# it answers "what would ship if we released today", which is what the auto-fix
+# job below can actually act on. The published image is scanned separately, by
+# post_release_report in the release workflow.
+#
+# Nothing here fails a build. The release workflow is the only place that blocks.
 
 on:
   schedule:
-    # Monday 06:00 UTC, ahead of the CodeQL and workflow-security sweeps.
-    - cron: "0 6 * * 1"
+    # Sunday 23:00 UTC — ahead of Monday's version bumpers, so a fix that lands
+    # in a new base image is picked up by the bump rather than pinned here.
+    - cron: "0 23 * * 0"
   workflow_dispatch:
 
-# Never two scans at once; a scheduled run and a manual one would only
-# duplicate the issue update.
+# Never two scans at once; a scheduled run and a manual one would only fight
+# over the same issues and branches.
 concurrency:
   group: scan-vulnerabilities
   cancel-in-progress: false
@@ -24,12 +29,12 @@ permissions:
 
 jobs:
   scan:
-    name: "Scan the published image"
+    name: "Scan the image"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
-      issues: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -39,94 +44,339 @@ jobs:
         with:
           persist-credentials: false
 
-      # The latest release, not the working tree: this is about what people
-      # are actually running.
-      - name: Resolve the published image
-        id: img
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag=$(git tag --sort=-creatordate | head -1 | sed 's/^v//')
-          if [ -z "$tag" ]; then
-            echo "no release tag yet — nothing published to scan"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}"     >> "$GITHUB_OUTPUT"
-          echo "scanning ${image}:${tag}"
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Scan
-        if: steps.img.outputs.skip != 'true'
+      - name: Build the image for scanning
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          tags: scan-target:scheduled
+
+      - name: Scan as JSON
         uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
         with:
-          scan-ref: ${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag }}
+          scan-ref: scan-target:scheduled
           severity: CRITICAL,HIGH
-          format: sarif
-          output: trivy-scheduled.sarif
+          trivyignores: .trivyignore
+          format: json
+          output: trivy.json
           exit-code: 0
 
-      - name: Upload results
-        if: always() && steps.img.outputs.skip != 'true'
+      - name: Scan as SARIF
+        if: always()
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: scan-target:scheduled
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy.sarif
+          exit-code: 0
+
+      - name: Upload results to the security tab
+        if: always()
         uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
         with:
-          sarif_file: trivy-scheduled.sarif
+          sarif_file: trivy.sarif
           category: trivy-scheduled
 
-      # A table for humans, so the issue below says something useful rather
-      # than pointing at a SARIF file.
-      - name: Scan again for a readable summary
-        if: steps.img.outputs.skip != 'true'
-        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+      # The JSON is what triage and auto-fix consume, so it has to outlive the job.
+      - name: Keep the JSON for the jobs below
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          scan-ref: ${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag }}
-          severity: CRITICAL,HIGH
-          format: table
-          output: trivy-scheduled.txt
-          exit-code: 0
+          name: trivy-json
+          path: trivy.json
+          retention-days: 7
+          if-no-files-found: error
 
-      # One issue, updated in place. A new issue every week for the same
-      # unfixed CVE is how people learn to ignore the scanner.
-      - name: Open or update the tracking issue
-        if: steps.img.outputs.skip != 'true'
+  # One issue per CVE, created, updated and closed automatically. A single
+  # lumped issue for everything is how people learn to stop reading the scanner.
+  triage:
+    name: "Triage CVEs into issues"
+    needs: scan
+    if: always() && needs.scan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: trivy-json
+
+      - name: Create, update and close issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          IMAGE: ${{ steps.img.outputs.image }}
-          TAG: ${{ steps.img.outputs.tag }}
         run: |
+          # SC2016: the single-quoted blocks below are jq programs, and $cve and
+          # $c are jq variables bound with --arg. Shell expansion is exactly what
+          # must not happen there.
           set -uo pipefail
-          findings=$(grep -cE '^\|' trivy-scheduled.txt 2>/dev/null || echo 0)
+          today=$(date +%Y-%m-%d)
 
-          title="Vulnerability scan: ${IMAGE}:${TAG}"
-          existing=$(gh issue list --repo "$REPO" --label security --state open \
-                      --search "$title in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+          cves=$(jq -r '.Results[]?.Vulnerabilities[]? |
+            select(.Severity == "CRITICAL" or .Severity == "HIGH") |
+            .VulnerabilityID' trivy.json 2>/dev/null | sort -u)
 
-          if [ "$findings" -eq 0 ]; then
-            echo "no CRITICAL or HIGH findings"
-            if [ -n "$existing" ]; then
-              gh issue close "$existing" --repo "$REPO" \
-                --comment "No CRITICAL or HIGH findings in the latest scan." || true
+          open_issues=$(gh issue list --repo "$REPO" --label security --state open \
+            --json number,title --limit 100 2>/dev/null || echo "[]")
+
+          # Close first, so an issue for a CVE the base image has since fixed does
+          # not sit open forever.
+          printf '%s' "$open_issues" | jq -r '.[].title' \
+            | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | while read -r old; do
+            [ -z "$old" ] && continue
+            if ! printf '%s\n' "$cves" | grep -qx "$old"; then
+              num=$(printf '%s' "$open_issues" | jq -r --arg c "$old" \
+                '.[] | select(.title | contains($c)) | .number' | head -1)
+              [ -n "$num" ] && gh issue close "$num" --repo "$REPO" \
+                --comment "No longer detected in the scheduled scan (${today}) — closing."
             fi
+          done
+
+          if [ -z "$cves" ]; then
+            echo "No CRITICAL or HIGH findings."
             exit 0
           fi
 
-          {
-            echo "Scheduled scan of the published image found CRITICAL or HIGH findings."
-            echo ""
-            echo "Image: \`${IMAGE}:${TAG}\`"
-            echo ""
-            echo '```'
-            head -100 trivy-scheduled.txt
-            echo '```'
-            echo ""
-            echo "Full results are in the security tab under \`trivy-scheduled\`."
-          } > /tmp/body.md
+          printf '%s\n' "$cves" | while read -r cve; do
+            [ -z "$cve" ] && continue
+            row=$(jq -r --arg cve "$cve" '
+              .Results[]?.Vulnerabilities[]? |
+              select(.VulnerabilityID == $cve) |
+              "\(.Severity)\t\(.PkgName)\t\(.FixedVersion // "unknown")\t\(.PkgID // "")"
+            ' trivy.json | head -1)
+            [ -z "$row" ] && continue
+            severity=$(printf '%s' "$row" | cut -f1)
+            pkg=$(printf '%s' "$row" | cut -f2)
+            fixed=$(printf '%s' "$row" | cut -f3)
 
-          if [ -n "$existing" ]; then
-            gh issue edit "$existing" --repo "$REPO" --body-file /tmp/body.md
-            echo "updated issue #${existing}"
-          else
-            gh issue create --repo "$REPO" --title "$title" \
-              --label security --body-file /tmp/body.md
+            labels="security,severity:$(printf '%s' "$severity" | tr '[:upper:]' '[:lower:]')"
+            [ "$fixed" = "unknown" ] && labels="${labels},no-fix-available"
+
+            existing=$(printf '%s' "$open_issues" | jq -r --arg c "$cve" \
+              '.[] | select(.title | contains($c)) | .number' | head -1)
+
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" \
+                --body "Still detected in the scheduled scan (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`."
+            else
+              body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**First detected:** %s\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
+                "$cve" "$severity" "$pkg" "$fixed" "$today" "$cve")
+              gh issue create --repo "$REPO" \
+                --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
+                --body "$body" --label "$labels"
+            fi
+          done
+
+  # Dependabot handles Go modules. Nothing handles the base image's OS packages,
+  # which is the gap this closes: a single alpine base can still carry CVEs, and
+  # waiting for alpine to ship a new tag is not always an option.
+  #
+  # Every candidate pin is test-built on both published architectures before it
+  # is proposed, because a package version that exists on amd64 and not on arm64
+  # would otherwise break the release build.
+  auto_fix:
+    name: "Open an auto-fix PR for fixable OS package CVEs"
+    needs: [scan, triage]
+    if: always() && needs.triage.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # An environment restricted to main, with no reviewer. This workflow is
+    # dispatchable from any branch, so without it anyone with write access could
+    # push a branch that alters this job to exfiltrate the token and simply run
+    # it. The branch policy refuses the secret to any ref but main; the weekly
+    # scheduled run is unaffected, because a schedule always runs from the
+    # default branch.
+    environment: cve-autofix
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # A fine-grained token, never a classic one. GitHub's deployment-approval
+      # endpoint accepts classic PATs with repo scope, so a classic token stored
+      # here would let any job in this repository approve a release.
+      - name: Check the token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CVE_AUTOFIX_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::CVE_AUTOFIX_TOKEN is not set — no auto-fix pull request will be opened. Findings are still tracked as issues."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Nothing is written to .git/config here. The branch, commit and push are
+      # done by create-pull-request at the end, which takes the credential as an
+      # input rather than leaving it on disk for later steps to find.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.token.outputs.skip != 'true'
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        if: steps.token.outputs.skip != 'true'
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        if: steps.token.outputs.skip != 'true'
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.token.outputs.skip != 'true'
+        with:
+          name: trivy-json
+
+      - name: Work out which pins are safe to propose
+        id: fix
+        if: steps.token.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # SC2016: the single-quoted blocks below are jq programs and an awk
+          # program; their $-prefixed names belong to those languages, not to
+          # the shell.
+          set -uo pipefail
+          today=$(date +%Y-%m-%d)
+          platforms="linux/amd64,linux/arm64"
+          echo "today=${today}" >> "$GITHUB_OUTPUT"
+
+          covered=$(gh pr list --repo "$REPO" --label security --state open \
+            --json body --limit 100 2>/dev/null \
+            | jq -r '.[].body // ""' | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u || true)
+
+          # Fixable OS-package findings only. Go module CVEs belong to Dependabot,
+          # and a CVE with no fixed version cannot be pinned to anything.
+          fixes=""
+          cve_map=""
+          while IFS=$'\t' read -r cve pkg fixed; do
+            [ -z "$cve" ] && continue
+            printf '%s\n' "$covered" | grep -qx "$cve" && continue
+            fixes="${fixes} ${pkg}=${fixed}"
+            cve_map="${cve_map} ${cve}:${pkg}=${fixed}"
+          done < <(jq -r '
+            .Results[]? | select(.Class == "os-pkgs") | .Vulnerabilities[]? |
+            select(
+              (.Severity == "CRITICAL" or .Severity == "HIGH") and
+              ((.FixedVersion // "") != "") and .FixedVersion != "unknown"
+            ) | "\(.VulnerabilityID)\t\(.PkgName)\t\(.FixedVersion)"
+          ' trivy.json | sort -u)
+
+          has_block=false
+          grep -q 'CVE security pins' Dockerfile && has_block=true
+
+          if [ -z "$fixes" ] && [ "$has_block" = false ]; then
+            echo "nothing fixable and no stale pin block — no pull request"
+            exit 0
+          fi
+
+          base=$(grep '^FROM alpine' Dockerfile | head -1 | awk '{print $2}')
+          verified=""
+          net_fault=false
+          net_re="Could not connect|connection timed out|Unable to connect|Temporary failure resolving|TLS handshake timeout|i/o timeout"
+
+          for pin in $(printf '%s' "$fixes" | tr ' ' '\n' | grep -v '^$' | sort -u); do
+            dir=$(mktemp -d)
+            printf 'FROM %s\nRUN apk add --no-cache %s\n' "$base" "$pin" > "${dir}/Dockerfile"
+            set +e
+            log=$(docker buildx build --platform "$platforms" "$dir" 2>&1)
+            rc=$?
+            set -e
+            rm -rf "$dir"
+            if [ "$rc" -eq 0 ]; then
+              verified="${verified} ${pin}"
+            elif printf '%s' "$log" | grep -qE "$net_re"; then
+              # Verification was inconclusive. Rewriting the block from a partial
+              # list would silently delete a pin that is still needed, so stop.
+              echo "::error::alpine mirror unreachable while verifying ${pin}"
+              net_fault=true
+            else
+              echo "::warning::${pin} does not build on ${platforms} — skipping that pin"
+              name=${pin%%=*}
+              num=$(printf '%s' "$cve_map" | tr ' ' '\n' | grep ":${name}=" | cut -d: -f1 | head -1)
+              if [ -n "$num" ]; then
+                issue=$(gh issue list --repo "$REPO" --label security --state open \
+                  --search "$num" --json number --jq '.[0].number' 2>/dev/null || true)
+                [ -n "$issue" ] && gh issue comment "$issue" --repo "$REPO" \
+                  --body "Auto-fix blocked: \`${pin}\` is not installable on all published platforms (\`${platforms}\`), so the pin was skipped."
+              fi
+            fi
+          done
+
+          if [ "$net_fault" = true ]; then
+            echo "aborting without a pull request so existing pins are preserved"
+            exit 1
+          fi
+
+          # Rebuild the auto-managed block. An empty verified list removes it,
+          # which is how a pin disappears once the base image ships the fix.
+          awk '/# --- CVE security pins \(auto-managed\)/{skip=1} /# --- end CVE security pins ---/{skip=0;next} !skip{print}' \
+            Dockerfile > Dockerfile.tmp
+          if [ -n "$verified" ]; then
+            pkgs=$(printf '%s' "$verified" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+            awk -v pkgs="$pkgs" '
+              /^USER / && !done {
+                print "# --- CVE security pins (auto-managed) ---"
+                printf "RUN apk add --no-cache %s\n", pkgs
+                print "# --- end CVE security pins ---"
+                print ""
+                done = 1
+              }
+              { print }
+            ' Dockerfile.tmp > Dockerfile
+          else
+            mv Dockerfile.tmp Dockerfile
+          fi
+          rm -f Dockerfile.tmp
+
+          if git diff --quiet -- Dockerfile; then
+            echo "no Dockerfile change to propose"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Automated fix for OS package CVEs found by the scheduled scan (${today})."
+            echo ""
+            if [ -n "$verified" ]; then
+              echo "**Pinned, verified to install on ${platforms}:**"
+              printf '%s' "$verified" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- `/; s/$/`/'
+            else
+              echo "**Stale pins removed** — the base image now ships these fixes natively."
+            fi
+            echo ""
+            printf '%s' "$cve_map" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /'
+          } > /tmp/pr.md
+
+      # The branch, commit and push are this action's job. It takes the
+      # credential as an input, so nothing is written to .git/config for a later
+      # step to pick up, and re-running the scan updates the existing pull
+      # request rather than opening a second one. docker-nginx-lego uses the
+      # same action for its bump and auto-fix pull requests.
+      - name: Open or update the auto-fix pull request
+        if: steps.token.outputs.skip != 'true' && steps.fix.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+        with:
+          token: ${{ secrets.CVE_AUTOFIX_TOKEN }}
+          base: main
+          branch: fix/cve-os-packages
+          delete-branch: true
+          title: "fix: pin OS packages for CVEs from the scheduled scan (${{ steps.fix.outputs.today }})"
+          body-path: /tmp/pr.md
+          commit-message: "fix: pin OS packages for CVEs from the scheduled scan (${{ steps.fix.outputs.today }})"
+          labels: security
+          add-paths: Dockerfile

@@ -1,0 +1,3 @@
+# Suppress CVEs that have been analysed and accepted.
+# Format: CVE-YYYY-NNNNN  # reason why accepted
+# Example: CVE-2026-12345  # upstream will not fix; not reachable from the webhook

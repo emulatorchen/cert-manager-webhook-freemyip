@@ -127,9 +127,12 @@ jobs:
     # value per domain, so the two tiers must never overlap — but its result
     # does not gate this. A conformance failure used to block the one test
     # that answers the question.
+    #
+    # Runs on every pull request, not only on dispatch. docker-nginx-lego proves
+    # a real staging certificate on each pull request, and a solver whose only
+    # job is to satisfy an ACME challenge should not merge on conformance alone.
     if: |
       always() &&
-      github.event_name == 'workflow_dispatch' &&
       needs.conformance.result != 'cancelled'
     needs: conformance
     runs-on: ubuntu-latest

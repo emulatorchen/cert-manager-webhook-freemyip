@@ -11,9 +11,35 @@ on:
   push:
     branches: [main]
     paths:
-      - "README.md"
+      - "docs/dockerhub_description.md"
       - ".github/workflows/update_dockerhub_description.yaml"
   workflow_dispatch:
+  # Called by the release workflow, so the Hub page is refreshed with every
+  # release without the account password ever entering the release environment.
+  # Environment scoping is per job: the job below reads the password from
+  # dockerhub-metadata, and no job in the calling workflow can reach it.
+  workflow_call:
+    inputs:
+      version:
+        description: "Version being released, for the summary. Optional."
+        required: false
+        type: string
+        default: ""
+    # Declared explicitly rather than using `secrets: inherit`, so the caller
+    # hands over this one value and nothing else.
+    #
+    # DOCKERHUB_PASSWORD is declared only to satisfy actionlint, which models
+    # the secrets context of a called workflow as exactly this list and does not
+    # know about environment secrets. The caller never passes it and could not
+    # usefully do so: GitHub's rule is that when a called workflow's job declares
+    # an environment, "the environment secret will be used, and not the secret
+    # passed from the caller workflow". So the value always comes from
+    # dockerhub-metadata, and a caller cannot substitute its own.
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_PASSWORD:
+        required: false
 
 # Serialise: two pushes in quick succession should not race to set the
 # description.
@@ -28,10 +54,16 @@ jobs:
   update:
     name: "Update Docker Hub description"
     runs-on: ubuntu-latest
-    # The account password lives behind the same reviewer gate as the publish
-    # credentials. It is the most powerful secret here: it can do anything the
-    # account can, not just push tags.
-    environment: release
+    # Its own environment, not `release`. The account password is the strongest
+    # credential this project holds — it can do anything the account can, not
+    # just push tags — so it is scoped to the one job that needs it. Nothing in
+    # the release workflow can read it, because a job may declare only one
+    # environment and those jobs declare `release`.
+    #
+    # Put DOCKERHUB_PASSWORD in the `dockerhub-metadata` environment and nowhere
+    # else. Give that environment a required reviewer too, so every use of the
+    # account password is a deliberate click.
+    environment: dockerhub-metadata
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -54,12 +86,62 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push the README to Docker Hub
+      # A page written for Docker Hub, not the GitHub README: the README tells
+      # people to clone the repository, which is meaningless to someone looking
+      # at a registry listing.
+      - name: Push the description to Docker Hub
         if: steps.check.outputs.skip != 'true'
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           "password": ${{ secrets.DOCKERHUB_PASSWORD }}
           repository: ${{ vars.DOCKERHUB_REPOSITORY }}
-          readme-filepath: ./README.md
+          readme-filepath: ./docs/dockerhub_description.md
           short-description: "cert-manager ACME DNS-01 webhook solver for freemyip.com"
+
+      # The source link on the Hub page. Set here as well as in the release, so
+      # it is correct even before the first release exists.
+      - name: Point the Docker Hub repository back at this repository
+        if: steps.check.outputs.skip != 'true'
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PW}\"}" \
+            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
+          if [ -z "$jwt" ]; then
+            echo "::warning::could not authenticate to the Docker Hub web API — vcs_url not updated"
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/" \
+            -H "Authorization: Bearer ${jwt}" \
+            -H "Content-Type: application/json" \
+            -d "{\"vcs_url\":\"https://github.com/${REPO}\"}")
+          echo "vcs_url update -> ${code}"
+
+      - name: Summarise
+        if: always()
+        env:
+          SKIPPED: ${{ steps.check.outputs.skip }}
+          VERSION: ${{ inputs.version }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          {
+            if [ -n "$VERSION" ]; then
+              echo "### Docker Hub page — release ${VERSION}"
+            else
+              echo "### Docker Hub page"
+            fi
+            echo ""
+            if [ "$SKIPPED" = "true" ]; then
+              echo "Skipped: DOCKERHUB_PASSWORD is not set in the dockerhub-metadata environment."
+            else
+              echo "Description and source link refreshed for \`${HUB_REPO}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
