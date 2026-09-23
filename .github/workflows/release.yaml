@@ -669,6 +669,21 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # chart-releaser commits the updated index to gh-pages, so git needs an
+      # identity. Without one it fails with "empty ident name" — but only after
+      # it has already created the release and the tag, leaving the index
+      # un-updated and the chart unreachable through `helm repo add`.
+      # Attributed to the bot, not to whoever pressed the button: these are
+      # machine-generated index commits and have no business in a person's
+      # contribution history. The address is GitHub's own noreply form, so the
+      # commits still attribute correctly without publishing an inbox in a
+      # public repository's permanent history.
+      - name: Give git an identity for the index commit
+        if: steps.pages.outputs.present == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Publish to the GitHub Pages chart repository
         if: steps.pages.outputs.present == 'true'
         uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
