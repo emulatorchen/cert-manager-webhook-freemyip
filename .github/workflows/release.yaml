@@ -518,6 +518,11 @@ jobs:
       "id-token": write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      # Set immediately before the push, so the cleanup below can tell "tags may
+      # exist" from "nothing ever left this runner". A rejected approval and a
+      # failure before the push both look like a failed job, and only this
+      # distinguishes them.
+      push_attempted: ${{ steps.mark.outputs.attempted }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -570,6 +575,10 @@ jobs:
             exit 1
           fi
           printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
+
+      - name: Record that the push is about to start
+        id: mark
+        run: echo "attempted=true" >> "$GITHUB_OUTPUT"
 
       # latest moves only here, in a reviewer-gated release — never from CI.
       # pull + no-cache: a published image is built from scratch against a
@@ -913,10 +922,18 @@ jobs:
   # Ungated on purpose, and it runs before the deletion job. A reviewer facing
   # an approval prompt after a failed release needs to know that approving
   # deletes tags rather than publishing anything.
+  # Only offered when the push actually started. A rejected approval fails the
+  # workflow exactly as a broken build does, so gating this on failure() asked
+  # for a second approval after every rejection — a question about deleting tags
+  # that were never pushed. push_attempted is the only thing that tells the two
+  # apart; cancelled() is kept because a job cancelled mid-push never gets to
+  # publish its outputs.
   cleanup_notice:
     name: "Pending: approve to delete partially published tags"
     needs: [resolve, publish_image, publish_chart]
-    if: always() && needs.resolve.result == 'success' && (failure() || cancelled())
+    if: |
+      always() && needs.resolve.result == 'success' &&
+      (needs.publish_image.outputs.push_attempted == 'true' || cancelled())
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -931,14 +948,18 @@ jobs:
           {
             echo "## Action required: approve Docker Hub tag deletion"
             echo ""
-            echo "The release failed or was cancelled part-way through."
+            echo "The push to Docker Hub started and the release did not finish."
+            echo "You are seeing this only because tags may actually exist — a"
+            echo "rejected release does not reach this point."
             echo ""
-            echo "**The next approval DELETEs only the tags this run pushed. It is not a new release attempt.**"
+            echo "**The next approval DELETEs one tag. It is not a new release attempt.**"
             echo ""
-            echo "Tags that will be deleted from \`${HUB_REPO}\` if they exist:"
+            echo "Tag that will be deleted from \`${HUB_REPO}\` if it exists:"
             echo ""
             echo "- \`${VERSION}\`"
-            echo "- \`latest\`"
+            echo ""
+            echo "\`latest\` is deliberately left alone: it still points at the last"
+            echo "good release, and a retry overwrites it anyway."
             echo ""
             echo "No git tag was created — this workflow creates it last, with the GitHub release — so"
             echo "there is nothing to unwind on the repository side."
@@ -986,9 +1007,12 @@ jobs:
             echo "could not authenticate to the Docker Hub API — delete the tags by hand"
             exit 1
           fi
-          for tag in "$VERSION" latest; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${tag}/" \
-              -H "Authorization: Bearer ${jwt}")
-            echo "delete ${HUB_REPO}:${tag} -> ${code}"
-          done
+          # The version tag only. `latest` is the mutable production pointer: if
+          # this run failed part-way, latest still points at the previous good
+          # release, and deleting it would take that release's pointer with it.
+          # A retry overwrites latest anyway. docker-nginx-lego excludes it for
+          # the same reason.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" \
+            -H "Authorization: Bearer ${jwt}")
+          echo "delete ${HUB_REPO}:${VERSION} -> ${code}"

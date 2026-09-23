@@ -164,9 +164,14 @@ done
 head_ "Rule 6 — cancellation cleanup present"
 for f in "$WF"/release.y*ml; do
   [ -e "$f" ] || continue
-  grep -qE 'if:.*cancelled\(\)' "$f" \
-    && ok "$(basename "$f"): has a cancelled() cleanup job" \
-    || bad "$(basename "$f"): no cancelled() cleanup job"
+  # Matched across the file rather than on one line: the guard is a multi-line
+  # `if:` block, because it also has to distinguish a push that started from a
+  # rejected approval, which fails the workflow identically.
+  if grep -qE 'cancelled\(\)' "$f" && grep -qE '^  cleanup_[A-Za-z0-9_]+:' "$f"; then
+    ok "$(basename "$f"): has a cleanup job covering cancellation"
+  else
+    bad "$(basename "$f"): no cleanup job covering cancellation"
+  fi
 done
 
 # ── 11. published images carry provenance and an SBOM ────────────────────────
