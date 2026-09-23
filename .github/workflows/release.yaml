@@ -548,11 +548,28 @@ jobs:
           GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
+      # A pasted secret often carries a trailing newline. Docker puts the value
+      # straight into an HTTP header, and the registry rejects the whole header
+      # as "malformed" without saying which field was wrong — which is exactly
+      # how the first release failed, with an error that looked like anything
+      # but whitespace. Trim both values, and name the offending secret without
+      # printing any part of it.
       - name: Log in to Docker Hub
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-        run: printf '%s' "$HUB_PAT" | docker login docker.io -u "$HUB_USER" --password-stdin
+        run: |
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "${#user}" -eq "${#HUB_USER}" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contained whitespace and was trimmed — re-save it without a trailing newline"
+          [ "${#pat}" -eq "${#HUB_PAT}" ] || \
+            echo "::warning::DOCKERHUB_RELEASE_TOKEN contained whitespace and was trimmed — re-save it without a trailing newline"
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
+            exit 1
+          fi
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
 
       # latest moves only here, in a reviewer-gated release — never from CI.
       # pull + no-cache: a published image is built from scratch against a
@@ -957,6 +974,10 @@ jobs:
             echo "no version resolved — nothing this run could have pushed"
             exit 0
           fi
+          # Trimmed for the same reason as the login above: a newline inside the
+          # JSON string below makes the body invalid, and the API just refuses.
+          HUB_USER=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          HUB_PAT=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
           jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PAT}\"}" \

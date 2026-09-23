@@ -78,13 +78,30 @@ jobs:
       - name: Check configuration
         id: check
         env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
         run: |
           if [ -z "$HUB_PW" ] || [ -z "$HUB_REPO" ]; then
             echo "DOCKERHUB_PASSWORD or DOCKERHUB_REPOSITORY not set — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # Fail here rather than inside the action below. A pasted secret with
+          # a trailing newline makes the action fail with a message that points
+          # nowhere; this names the secret without printing any part of it. The
+          # action takes its inputs directly, so the value cannot be trimmed for
+          # it — passing a corrected copy through a step output would put the
+          # secret somewhere it does not belong.
+          reject_whitespace() {
+            trimmed=$(printf '%s' "$2" | tr -d '[:space:]')
+            if [ "${#trimmed}" -ne "${#2}" ]; then
+              echo "::error::$1 contains whitespace — re-save it with no trailing newline"
+              exit 1
+            fi
+          }
+          reject_whitespace DOCKERHUB_USERNAME "$HUB_USER"
+          reject_whitespace DOCKERHUB_PASSWORD "$HUB_PW"
 
       # A page written for Docker Hub, not the GitHub README: the README tells
       # people to clone the repository, which is meaningless to someone looking
@@ -110,6 +127,11 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
+          # Belt and braces: the check step above already fails the job on a
+          # whitespace-bearing secret, so this only guards against a value that
+          # changed between steps.
+          HUB_USER=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          HUB_PW=$(printf '%s' "$HUB_PW" | tr -d '[:space:]')
           jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PW}\"}" \
