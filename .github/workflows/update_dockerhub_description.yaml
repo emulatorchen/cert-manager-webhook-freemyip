@@ -103,6 +103,15 @@ jobs:
           reject_whitespace DOCKERHUB_USERNAME "$HUB_USER"
           reject_whitespace DOCKERHUB_PASSWORD "$HUB_PW"
 
+          # Reported, never corrected, and never fatal. Docker Hub today wants
+          # the lowercase Docker ID and rejects anything else as a malformed
+          # authorization header, which looks like an encoding fault rather than
+          # a wrong username. The value is passed through exactly as stored, so
+          # if Docker Hub ever accepts mixed case nothing here has to change.
+          if [ "$HUB_USER" != "$(printf '%s' "$HUB_USER" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the calls below fail with a malformed authorization header, that is why."
+          fi
+
       # A page written for Docker Hub, not the GitHub README: the README tells
       # people to clone the repository, which is meaningless to someone looking
       # at a registry listing.
