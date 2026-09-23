@@ -568,6 +568,14 @@ jobs:
           pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
           [ "${#user}" -eq "${#HUB_USER}" ] || \
             echo "::warning::DOCKERHUB_USERNAME contained whitespace and was trimmed — re-save it without a trailing newline"
+          # Reported, never corrected, and never fatal. Docker Hub today wants
+          # the lowercase Docker ID and rejects anything else as a malformed
+          # authorization header — which reads as an encoding fault rather than
+          # a wrong username, and cost three release attempts to find. The value
+          # is still passed through exactly as stored, so if Docker Hub ever
+          # accepts mixed case nothing here has to change.
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
           [ "${#pat}" -eq "${#HUB_PAT}" ] || \
             echo "::warning::DOCKERHUB_RELEASE_TOKEN contained whitespace and was trimmed — re-save it without a trailing newline"
           if [ -z "$user" ] || [ -z "$pat" ]; then
@@ -997,6 +1005,7 @@ jobs:
           fi
           # Trimmed for the same reason as the login above: a newline inside the
           # JSON string below makes the body invalid, and the API just refuses.
+          # Case is left exactly as stored.
           HUB_USER=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
           HUB_PAT=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
           jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
