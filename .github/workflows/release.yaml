@@ -90,6 +90,21 @@ jobs:
             echo "repository variable DOCKERHUB_REPOSITORY is not set (expected e.g. emulator/cert-manager-webhook-freemyip)"
             exit 1
           fi
+          # Refuse a version that is already published somewhere it cannot be
+          # overwritten. A Docker Hub tag rule makes version tags immutable, so
+          # discovering the clash at push time means a half-published run and a
+          # version number burned. Checked through the public API, so this needs
+          # no credentials and runs before the reviewer is asked for anything.
+          #
+          # ghcr is deliberately NOT checked: its tags are overwritable, so
+          # leftovers from a failed run must not block a legitimate retry of the
+          # same version.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/")
+          if [ "$code" = "200" ]; then
+            echo "::error::${HUB_REPO}:${version} is already published on Docker Hub. Delete that tag or pick another version — a release must never overwrite a published one."
+            exit 1
+          fi
 
           {
             echo "version=${version}"
