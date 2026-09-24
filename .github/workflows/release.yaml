@@ -813,7 +813,8 @@ jobs:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           charts_dir: charts
-          skip_existing: true
+          packages_with_index: true
+          skip_upload: true
 
   github_release:
     name: "Create GitHub release"
