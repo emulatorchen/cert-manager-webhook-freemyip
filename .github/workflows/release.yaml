@@ -82,6 +82,17 @@ jobs:
                       | sed 's/^appVersion:[[:space:]]*//; s/"//g')
           fi
           [ -n "$version" ] || { echo "could not resolve a version"; exit 1; }
+
+          # The chart repository publishes whatever Chart.yaml's `version:`
+          # says — it does not see this input. If the two disagree, the images
+          # and the GitHub release carry one number while `helm repo add` users
+          # get another. Caught here rather than discovered in the index.
+          chart_version=$(grep -m1 '^version:' charts/cert-manager-webhook-freemyip/Chart.yaml \
+                          | sed 's/^version:[[:space:]]*//; s/"//g')
+          if [ "$chart_version" != "$version" ]; then
+            echo "::error::releasing ${version} but Chart.yaml says version: ${chart_version}. The chart repository would publish ${chart_version}. Update Chart.yaml, or release the version it already names."
+            exit 1
+          fi
           if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
             echo "tag v${version} already exists — bump the version, or delete the tag to re-release"
             exit 1
@@ -90,6 +101,37 @@ jobs:
             echo "repository variable DOCKERHUB_REPOSITORY is not set (expected e.g. emulator/cert-manager-webhook-freemyip)"
             exit 1
           fi
+          # Refuse a version that is already published somewhere it cannot be
+          # overwritten. A Docker Hub tag rule makes version tags immutable, so
+          # discovering the clash at push time means a half-published run and a
+          # version number burned. Checked through the public API, so this needs
+          # no credentials and runs before the reviewer is asked for anything.
+          #
+          # ghcr is deliberately NOT checked: its tags are overwritable, so
+          # leftovers from a failed run must not block a legitimate retry of the
+          # same version.
+          # A bare curl under `set -e` turns a DNS blip into a failed release,
+          # and treats every non-200 as "safe to proceed" — including the 401
+          # or 404 you get from a private repository or a typo in the variable,
+          # where the guard would be protecting nothing. Retry, and only accept
+          # a clean 200 or 404 as an answer.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-all-errors --max-time 30 \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/" || echo "000")
+          case "$code" in
+            200)
+              echo "::error::${HUB_REPO}:${version} is already published on Docker Hub. Delete that tag or pick another version — a release must never overwrite a published one."
+              exit 1
+              ;;
+            404)
+              echo "${HUB_REPO}:${version} is not published yet"
+              ;;
+            *)
+              echo "::error::could not determine whether ${HUB_REPO}:${version} is already published (HTTP ${code}). Refusing to release blind — check DOCKERHUB_REPOSITORY and that the repository is public."
+              exit 1
+              ;;
+          esac
+
           {
             echo "version=${version}"
             echo "tag=v${version}"
@@ -588,7 +630,12 @@ jobs:
         id: mark
         run: echo "attempted=true" >> "$GITHUB_OUTPUT"
 
-      # latest moves only here, in a reviewer-gated release — never from CI.
+      # Version tags only. `latest` is what users follow, so it must not move
+      # until the whole release has been confirmed — a failure after this point
+      # would otherwise leave `latest` pointing at a build that was never
+      # released, and nothing can take that back. promote_latest, after the
+      # gate, moves it by re-tagging this exact digest.
+      #
       # pull + no-cache: a published image is built from scratch against a
       # freshly pulled base, never from a layer cache of unknown age.
       - name: Build and push
@@ -604,9 +651,7 @@ jobs:
           sbom: true
           tags: |
             ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-            ${{ needs.resolve.outputs.ghcr_image }}:latest
             ${{ needs.resolve.outputs.hub_image }}:${{ needs.resolve.outputs.version }}
-            ${{ needs.resolve.outputs.hub_image }}:latest
 
       - name: Attest the ghcr image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -653,30 +698,10 @@ jobs:
             --app-version "$VERSION"
           helm push "cert-manager-webhook-freemyip-${VERSION}.tgz" "$CHARTS"
 
-      # The OCI registry above is private until the package is made public by
-      # hand, so it cannot be the only route. A GitHub Pages chart repo is
-      # public the moment it exists and is what `helm repo add` expects.
-      #
-      # Skipped until the gh-pages branch exists, so the release does not fail
-      # on a repository that has not been set up for Pages yet.
-      - name: Check for the gh-pages branch
-        id: pages
-        run: |
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::no gh-pages branch — skipping the Helm repository publish. Create it and enable GitHub Pages to serve the chart over helm repo add."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish to the GitHub Pages chart repository
-        if: steps.pages.outputs.present == 'true'
-        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
-        env:
-          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          charts_dir: charts
-          skip_existing: true
+      # The chart repository index is deliberately NOT updated here. It is what
+      # `helm repo add` reads, so publishing it before the gate would advertise
+      # a version whose release had not been confirmed. publish_chart_index,
+      # after the gate, does that.
 
       - name: Keep the packaged chart for the release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -723,13 +748,160 @@ jobs:
           done
           echo "all gates passed"
 
-  github_release:
-    name: "Create GitHub release"
-    # Behind release_gate rather than the publish jobs directly, so the
-    # release is only announced once every gate and both publishes have been
-    # confirmed together.
+  # Everything a user can see moves only after the gate, and only by pointing at
+  # what was already published and verified.
+  #
+  # imagetools create re-tags the existing manifest list rather than rebuilding,
+  # so `latest` is byte-for-byte the digest that passed every check. A rebuild
+  # here could produce a different image under the same version.
+  promote_latest:
+    name: "Move latest to the released version"
+    # After the chart index, deliberately. If the index fails, `latest` has not
+    # moved and nothing a user follows has changed at all.
+    needs: [resolve, release_gate, publish_chart_index]
+    if: |
+      always() && needs.release_gate.result == 'success' &&
+      needs.publish_chart_index.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # The same guards as the publish login. This runs after the gate, with
+      # both version tags already published, so an opaque credential failure
+      # here strands the release between published and announced — the worst
+      # place to rediscover a mis-cased username.
+      - name: Log in to Docker Hub
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: |
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
+            exit 1
+          fi
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
+
+      - name: Log in to ghcr.io
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      # Docker Hub first, deliberately. It is the registry the chart points at
+      # and the only one whose tags can become immutable, so if the second
+      # retag fails the inconsistency is left on the copy fewer people follow.
+      - name: Point latest at the released digest
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${HUB_IMAGE}:latest" "${HUB_IMAGE}:${VERSION}"
+          docker buildx imagetools create --tag "${GHCR_IMAGE}:latest" "${GHCR_IMAGE}:${VERSION}"
+          echo "latest now points at ${VERSION} on both registries"
+
+  # The chart repository index, published after the gate for the same reason:
+  # it is what `helm repo add` reads.
+  #
+  # packages_with_index puts the .tgz on the publishing branch beside
+  # index.yaml, so the index serves files from the branch rather than from
+  # release assets. It also implies --skip-existing, so a retry no longer trips
+  # over a release left behind by a failed attempt.
+  #
+  # It does NOT stop the action creating a release of its own: cr upload runs
+  # regardless, so each version gets both `v<version>` from github_release and
+  # `cert-manager-webhook-freemyip-<version>` from here. Suppressing that would
+  # mean owning the index commit and push ourselves, which needs a credential
+  # decision on a checkout that deliberately keeps none.
+  publish_chart_index:
+    name: "Publish the chart repository index"
     needs: [resolve, release_gate]
     if: always() && needs.release_gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Skipped rather than failed until the branch exists, so a repository not
+      # yet set up for Pages still releases everything else.
+      - name: Check for the gh-pages branch
+        id: pages
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no gh-pages branch — the chart is still on the OCI registry and attached to the release, but helm repo add will not work. Create the branch and enable Pages."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # chart-releaser commits the index, so git needs an identity. Attributed
+      # to the bot: these are machine-generated commits and do not belong in a
+      # person's contribution history.
+      - name: Give git an identity for the index commit
+        if: steps.pages.outputs.present == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Publish to the GitHub Pages chart repository
+        if: steps.pages.outputs.present == 'true'
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          charts_dir: charts
+          packages_with_index: true
+
+      # The action above can report success without publishing anything: it
+      # skips silently when charts/ is unchanged since the last tag, and its
+      # index step is skipped entirely by some input combinations. Both leave a
+      # green job whose name promises an index that nobody updated — and
+      # promote_latest and github_release both key off that success. So the
+      # index is read back and checked to actually advertise this version.
+      - name: Verify the index advertises this version
+        if: steps.pages.outputs.present == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin gh-pages
+          if ! git show "origin/gh-pages:index.yaml" 2>/dev/null | grep -q "^\([[:space:]]*\)version: ${VERSION}$"; then
+            echo "::error::index.yaml on gh-pages does not advertise ${VERSION}. The chart repository was not updated, so helm repo add users would not see this release."
+            exit 1
+          fi
+          echo "index.yaml advertises ${VERSION}"
+
+  github_release:
+    name: "Create GitHub release"
+    # Announced last, after the chart index and latest have both moved, so the
+    # release list never advertises a version the other two do not yet serve.
+    needs: [resolve, release_gate, promote_latest, publish_chart_index]
+    if: |
+      always() && needs.release_gate.result == 'success' &&
+      needs.promote_latest.result == 'success' &&
+      needs.publish_chart_index.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release
@@ -939,9 +1111,16 @@ jobs:
   cleanup_notice:
     name: "Pending: approve to delete partially published tags"
     needs: [resolve, publish_image, publish_chart]
+    # Both halves are required. push_attempted alone is true on a *successful*
+    # release too, which would park a "approve to delete" prompt after every
+    # clean release — and approving it would delete the version just published.
+    # failure()/cancelled() alone was the original bug: a rejected approval
+    # fails the workflow identically to a broken build, so it asked to delete
+    # tags that were never pushed.
     if: |
       always() && needs.resolve.result == 'success' &&
-      (needs.publish_image.outputs.push_attempted == 'true' || cancelled())
+      needs.publish_image.outputs.push_attempted == 'true' &&
+      (failure() || cancelled())
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -966,8 +1145,8 @@ jobs:
             echo ""
             echo "- \`${VERSION}\`"
             echo ""
-            echo "\`latest\` is deliberately left alone: it still points at the last"
-            echo "good release, and a retry overwrites it anyway."
+            echo "\`latest\` was never moved. It only moves after the release gate"
+            echo "passes, so it still points at the last good release."
             echo ""
             echo "No git tag was created — this workflow creates it last, with the GitHub release — so"
             echo "there is nothing to unwind on the repository side."
