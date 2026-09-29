@@ -10,6 +10,14 @@
 # It is suppressed here rather than with inline `# shellcheck disable`
 # directives, which actionlint does not honour inside a run: block.
 #
+# Two workflows are also called by others, and their environment-gated jobs
+# read environment secrets that are deliberately NOT declared under
+# on.workflow_call.secrets. actionlint models a called workflow's secrets as
+# exactly that list and does not know about environment secrets, so it reports
+# them as undefined. Declaring them is not harmless: release #6 read a secret
+# that was declared but never passed as empty. So each one is ignored by name,
+# in the one file that uses it, and nothing broader.
+#
 # Nothing else is suppressed. SC2086 (unquoted expansion), SC2046 (word
 # splitting on command substitution) and the rest still fail the build, and so
 # does every actionlint rule of its own.
@@ -17,3 +25,10 @@ paths:
   .github/workflows/**:
     ignore:
       - 'shellcheck reported issue in this script: SC2016'
+  .github/workflows/withdraw_release.yaml:
+    ignore:
+      - 'property "dockerhub_release_token" is not defined'
+      - 'property "ghcr_delete_token" is not defined'
+  .github/workflows/update_dockerhub_description.yaml:
+    ignore:
+      - 'property "dockerhub_password" is not defined'

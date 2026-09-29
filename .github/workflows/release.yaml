@@ -13,10 +13,17 @@ name: release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, without the leading v (e.g. 0.2.0). Blank uses the chart appVersion."
-        required: false
-        default: ""
+      # No version input. Like docker-nginx-lego, the release works its own
+      # version out; unlike it, this project has a real semver, so the only
+      # choice left to a person is how far to move it.
+      bump:
+        description: "How to move from the last published release: patch (0.1.0 → 0.1.1), minor (→ 0.2.0) or major (→ 1.0.0)"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
       notes:
         description: "Release notes. Blank auto-generates them from merged pull requests; text is prepended before the generated notes unless override is checked."
         required: false
@@ -71,30 +78,45 @@ jobs:
 
       # ghcr.io rejects uppercase in repository names, but github.repository
       # and github.repository_owner preserve the owner's casing.
+      # The version is worked out, never typed — docker-nginx-lego's model,
+      # carried over and tightened:
+      #
+      # - It counts from the last PUBLISHED release, not from tags. A draft, a
+      #   pre-release, or an attempt that was rolled back publishes nothing, so
+      #   the next run computes the same number again. Failed attempts never
+      #   advance the version (lego pushes its tag in this first job, before
+      #   any approval, so a rejected run still consumes one).
+      # - Nothing is written here. The tag appears with the GitHub release,
+      #   after the approval, and the rollback removes it.
+      # - The chart's version is stamped at packaging time, as the digest is,
+      #   so there is no second copy of the number to keep in step.
       - name: Resolve version and targets
         id: v
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          version="$INPUT_VERSION"
-          if [ -z "$version" ]; then
-            version=$(grep -m1 '^appVersion:' charts/cert-manager-webhook-freemyip/Chart.yaml \
-                      | sed 's/^appVersion:[[:space:]]*//; s/"//g')
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+                     --limit 100 --json tagName --jq '.[].tagName' \
+                   | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            version="0.1.0"
+            echo "no published release yet — starting at ${version}"
+          else
+            IFS=. read -r major minor patch <<< "$latest"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="${major}.$((minor + 1)).0" ;;
+              patch) version="${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::unknown bump '${BUMP}'"; exit 1 ;;
+            esac
+            echo "last published release ${latest}, ${BUMP} bump -> ${version}"
           fi
-          [ -n "$version" ] || { echo "could not resolve a version"; exit 1; }
-
-          # The chart repository publishes whatever Chart.yaml's `version:`
-          # says — it does not see this input. If the two disagree, the images
-          # and the GitHub release carry one number while `helm repo add` users
-          # get another. Caught here rather than discovered in the index.
-          chart_version=$(grep -m1 '^version:' charts/cert-manager-webhook-freemyip/Chart.yaml \
-                          | sed 's/^version:[[:space:]]*//; s/"//g')
-          if [ "$chart_version" != "$version" ]; then
-            echo "::error::releasing ${version} but Chart.yaml says version: ${chart_version}. The chart repository would publish ${chart_version}. Update Chart.yaml, or release the version it already names."
-            exit 1
-          fi
+          # Exactly X.Y.Z: it is also what Docker Hub's immutability rule matches.
+          printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::'${version}' is not X.Y.Z"; exit 1; }
           if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
             echo "tag v${version} already exists — bump the version, or delete the tag to re-release"
             exit 1
@@ -108,6 +130,15 @@ jobs:
           fi
           if [ -z "$HUB_REPO" ]; then
             echo "repository variable DOCKERHUB_REPOSITORY is not set (expected e.g. emulator/cert-manager-webhook-freemyip)"
+            exit 1
+          fi
+          # An earlier attempt that failed and was not rolled back leaves the
+          # chart repository advertising this version, and chart-releaser would
+          # then fail half-way through. Refuse up front and say how to clear it.
+          pages="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}"
+          if curl -fsS --retry 3 --max-time 30 "${pages}/index.yaml" 2>/dev/null \
+             | grep -qE "^[[:space:]]+version: ${version}\$"; then
+            echo "::error::the chart repository already advertises ${version}, left by an earlier attempt that was not rolled back. Run 'Withdraw a release' for ${version}, then release again."
             exit 1
           fi
           # Refuse a version that is already published somewhere it cannot be
@@ -129,7 +160,7 @@ jobs:
             "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/" || echo "000")
           case "$code" in
             200)
-              echo "::error::${HUB_REPO}:${version} is already published on Docker Hub. Delete that tag or pick another version — a release must never overwrite a published one."
+              echo "::error::${HUB_REPO}:${version} is already published on Docker Hub. The version tag is the last thing a release writes, so this version was released in full. Pick another version — a release never overwrites a published one, and this tag is immutable."
               exit 1
               ;;
             404)
@@ -598,7 +629,9 @@ jobs:
             --version "$VERSION" \
             --app-version "$VERSION"
 
-      - name: Keep the packaged chart for the release
+      # Kept for inspection only. The chart that is published is packaged again
+      # after the image is pushed, pinned to its digest, by publish_chart_oci.
+      - name: Keep the pre-approval package for inspection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: chart
@@ -702,30 +735,38 @@ jobs:
             echo ""
             echo "Publication order from here, each step reachable only through this one:"
             echo ""
-            echo "1. image version tags on ghcr and Docker Hub — immutable, nothing points at them yet"
-            echo "2. the chart on the OCI registry"
+            echo "1. the image, by digest, on ghcr and Docker Hub — no Docker Hub tag yet"
+            echo "2. the chart on the OCI registry, pinned to that digest"
             echo "3. the chart repository index on gh-pages"
             echo "4. the GitHub release and the \`v${VERSION}\` tag"
-            echo "5. \`latest\`, last of all"
+            echo "5. \`latest\`, then the vulnerability scan and the pages"
+            echo "6. **commit:** the Docker Hub version tag — immutable, so it comes last"
+            echo ""
+            echo "Anything failing before step 6 is rolled back, behind its own approval."
+            echo "Nothing irreversible exists until step 6 succeeds."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The first write of the release.
+  # The first write of the release: the image, pushed by digest.
   #
-  # Version tags only, and that is the point: a version tag is inert. Nothing
-  # resolves it by name until an install route advertises it, and all three
-  # install routes are published after this job. `latest` is the one pointer
-  # people actually follow, so it moves last, in promote_latest.
+  # To ghcr and to Docker Hub, but with NO Docker Hub version tag. Docker Hub
+  # version tags are immutable — once created they can be neither overwritten
+  # nor deleted — so creating one here would make every later failure
+  # permanent. Content pushed by digest is present but unnamed: nothing
+  # resolves it unless handed the digest, and everything this release publishes
+  # hands out exactly that digest. The version tag is created by commit_tag,
+  # the last job, once every other write has succeeded — so the tag and the
+  # release's metadata succeed together or not at all.
   #
-  # It builds here rather than promoting something staged earlier: staging put a
-  # push before the approval, and a run-scoped ghcr tag is still a write and
-  # still a package version on the account. `scan` already builds this same
-  # image locally (load, never push) and fails the run before the approval is
-  # ever offered, so nothing is lost by building late.
+  # ghcr does get its version tag here: ghcr tags are deletable, so a failure
+  # later can take it back.
+  #
+  # `scan` already builds this same image locally (load, never push) and fails
+  # the run before the approval is offered, so nothing is lost by building late.
   #
   # pull + no-cache: a published image is built from scratch against a freshly
   # pulled base, never from a layer cache of unknown age.
   publish_image:
-    name: "Publish the image version tags"
+    name: "Push the image by digest"
     needs: [resolve, release_approval]
     if: always() && needs.release_approval.result == 'success'
     runs-on: ubuntu-latest
@@ -785,20 +826,28 @@ jobs:
         id: mark
         run: echo "attempted=true" >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish the version tags
+      # push-by-digest writes the index and its manifests to both registries
+      # without creating any tag — the pattern Docker documents for builds that
+      # are tagged later. name-canonical keeps the reference fully qualified.
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
           pull: true
           no-cache: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-            ${{ needs.resolve.outputs.hub_image }}:${{ needs.resolve.outputs.version }}
+          outputs: type=image,"name=${{ needs.resolve.outputs.ghcr_image }},${{ needs.resolve.outputs.hub_image }}",push-by-digest=true,name-canonical=true,push=true
+
+      # ghcr only. Deletable, so it can be taken back if the release fails.
+      - name: Tag the ghcr copy
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools create --tag "${GHCR_IMAGE}:${VERSION}" "${GHCR_IMAGE}@${DIGEST}"
 
       # One digest recorded under both names, so verification succeeds whichever
       # registry the image was pulled from.
@@ -816,30 +865,38 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: false
 
-      # The build action reports the digest it pushed. It does not prove either
-      # registry now serves that digest under the version tag — and a tag
-      # resolving to the wrong image is worse than a tag that is missing,
-      # because everything downstream would publish and advertise it.
-      - name: Verify both registries serve the built digest
+      # The build action reports the digest it pushed; it does not prove either
+      # registry now serves it. ghcr must serve it under the version tag, Docker
+      # Hub under the digest — and Docker Hub must NOT yet have the version tag,
+      # because that belongs to commit_tag and only commit_tag.
+      - name: Verify what each registry now serves
         env:
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
           VERSION: ${{ needs.resolve.outputs.version }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          for ref in "${GHCR_IMAGE}:${VERSION}" "${HUB_IMAGE}:${VERSION}"; do
-            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
-            if [ "$got" != "$DIGEST" ]; then
-              echo "::error::${ref} resolves to ${got}, expected ${DIGEST}"
-              exit 1
-            fi
-            echo "${ref} -> ${got}"
-          done
+          at() { docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'; }
+          [ "$(at "${GHCR_IMAGE}:${VERSION}")" = "$DIGEST" ] \
+            || { echo "::error::${GHCR_IMAGE}:${VERSION} does not resolve to ${DIGEST}"; exit 1; }
+          [ "$(at "${HUB_IMAGE}@${DIGEST}")" = "$DIGEST" ] \
+            || { echo "::error::Docker Hub does not serve ${DIGEST}"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/")
+          [ "$code" = "404" ] \
+            || { echo "::error::${HUB_REPO}:${VERSION} already exists (HTTP ${code}) — only commit_tag may create it"; exit 1; }
+          echo "ghcr:${VERSION} and Docker Hub@digest serve ${DIGEST}; Docker Hub has no version tag yet"
 
-  # The chart at its version number, pushed only once the image it references
-  # actually exists. The packaged file comes from before the gate; this job
-  # only uploads it.
+  # The chart on the OCI registry — an install route, so it is published only
+  # once the image exists, and it pins that image by digest. Every install
+  # route therefore works before the Docker Hub version tag exists, which is
+  # what lets that tag be the last write of the release.
+  #
+  # Packaged here rather than taken from before the gate: the digest only
+  # exists once publish_image has run. This one file is also what the GitHub
+  # release attaches, so every route serves byte-identical chart content.
   publish_chart_oci:
     name: "Publish the chart to the OCI registry"
     needs: [resolve, release_approval, publish_image]
@@ -855,10 +912,29 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          name: chart
+          persist-credentials: false
+
+      - name: Pin the chart to the published digest and package it
+        env:
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
+          # One line, in place. yq would re-serialise the whole file — dropping
+          # blank lines and re-indenting comments — so `helm show values` would
+          # show users a file that differs from the source in more than the pin.
+          v=charts/cert-manager-webhook-freemyip/values.yaml
+          [ "$(grep -c '^  digest: ""$' "$v")" = "1" ] \
+            || { echo "::error::expected exactly one empty image.digest line in ${v}"; exit 1; }
+          sed -i "s|^  digest: \"\"\$|  digest: \"${DIGEST}\"|" "$v"
+          [ "$(yq -r '.image.digest' "$v")" = "$DIGEST" ] \
+            || { echo "::error::image.digest was not pinned to ${DIGEST}"; exit 1; }
+          helm package charts/cert-manager-webhook-freemyip \
+            --version "$VERSION" --app-version "$VERSION"
 
       - name: Push the packaged chart
         env:
@@ -872,13 +948,13 @@ jobs:
           helm push "cert-manager-webhook-freemyip-${VERSION}.tgz" "$CHARTS"
 
       # `helm push` exiting 0 says the upload was accepted, not that the
-      # registry will serve this version to an install. Pulled back and read,
-      # the same way the chart repository index is.
+      # registry will serve this version to an install. Pulled back and read.
       - name: Verify the OCI registry serves this chart
         env:
           CHARTS: ${{ needs.resolve.outputs.charts }}
           VERSION: ${{ needs.resolve.outputs.version }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
         run: |
           set -euo pipefail
           rm -rf /tmp/oci && mkdir -p /tmp/oci
@@ -888,12 +964,21 @@ jobs:
           got_v=$(tar -xzOf "$f" cert-manager-webhook-freemyip/Chart.yaml | yq -r '.version')
           got_av=$(tar -xzOf "$f" cert-manager-webhook-freemyip/Chart.yaml | yq -r '.appVersion')
           got_img=$(tar -xzOf "$f" cert-manager-webhook-freemyip/values.yaml | yq -r '.image.repository')
+          got_dg=$(tar -xzOf "$f" cert-manager-webhook-freemyip/values.yaml | yq -r '.image.digest')
           fail=0
           [ "$got_v" = "$VERSION" ]     || { echo "::error::OCI chart is version ${got_v}, expected ${VERSION}"; fail=1; }
           [ "$got_av" = "$VERSION" ]    || { echo "::error::OCI chart has appVersion ${got_av}, expected ${VERSION}"; fail=1; }
           [ "$got_img" = "$HUB_IMAGE" ] || { echo "::error::OCI chart points at ${got_img}, expected ${HUB_IMAGE}"; fail=1; }
+          [ "$got_dg" = "$DIGEST" ]     || { echo "::error::OCI chart pins ${got_dg}, expected ${DIGEST}"; fail=1; }
           [ "$fail" = "0" ] || exit 1
-          echo "${CHARTS} serves ${VERSION}: chart ${got_v}, appVersion ${got_av}, image ${got_img}"
+          echo "${CHARTS} serves ${VERSION}, pinned to ${got_img}@${got_dg}"
+
+      - name: Keep the packaged chart for the release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chart-release
+          path: cert-manager-webhook-freemyip-*.tgz
+          if-no-files-found: error
 
   # The chart repository index, last of the three publishes: it advertises a
   # version, so the image and the OCI chart must already be there or a
@@ -929,16 +1014,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Skipped rather than failed until the branch exists, so a repository not
-      # yet set up for Pages still releases everything else.
+      # Fatal now. This used to skip with a warning so a repository not yet set
+      # up for Pages could still release. Pages is set up, and the chart
+      # repository is one of the install routes the Docker Hub tag is bound to —
+      # committing the tag without it would publish a release `helm repo add`
+      # users cannot see. `present` stays so the steps below read the same.
       - name: Check for the gh-pages branch
         id: pages
         run: |
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::no gh-pages branch — the chart is still on the OCI registry and attached to the release, but helm repo add will not work. Create the branch and enable Pages."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::error::no gh-pages branch — the chart repository cannot be published, so the release stops here and rolls back. Create the branch and enable Pages."
+            exit 1
           fi
 
       # chart-releaser commits the index, so git needs an identity. Attributed
@@ -949,6 +1037,40 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # chart-releaser packages from the checkout, so the version and the digest
+      # are stamped into the checkout — the same values the OCI chart carries.
+      # `helm package --version` does this for the OCI chart; chart-releaser has
+      # no such option, so Chart.yaml itself is set.
+      - name: Stamp the chart with the release version and digest
+        if: steps.pages.outputs.present == 'true'
+        env:
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          c=charts/cert-manager-webhook-freemyip/Chart.yaml
+          for key in version appVersion; do
+            [ "$(grep -c "^${key}:" "$c")" = "1" ] \
+              || { echo "::error::expected exactly one ${key}: line in ${c}"; exit 1; }
+          done
+          sed -i -E "s|^version:.*$|version: ${VERSION}|; s|^appVersion:.*$|appVersion: \"${VERSION}\"|" "$c"
+          if [ "$(yq -r '.version' "$c")" != "$VERSION" ] || [ "$(yq -r '.appVersion' "$c")" != "$VERSION" ]; then
+            echo "::error::Chart.yaml was not stamped with ${VERSION}"
+            exit 1
+          fi
+
+          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
+          # One line, in place. yq would re-serialise the whole file — dropping
+          # blank lines and re-indenting comments — so `helm show values` would
+          # show users a file that differs from the source in more than the pin.
+          v=charts/cert-manager-webhook-freemyip/values.yaml
+          [ "$(grep -c '^  digest: ""$' "$v")" = "1" ] \
+            || { echo "::error::expected exactly one empty image.digest line in ${v}"; exit 1; }
+          sed -i "s|^  digest: \"\"\$|  digest: \"${DIGEST}\"|" "$v"
+          [ "$(yq -r '.image.digest' "$v")" = "$DIGEST" ] \
+            || { echo "::error::image.digest was not pinned to ${DIGEST}"; exit 1; }
 
       - name: Publish to the GitHub Pages chart repository
         if: steps.pages.outputs.present == 'true'
@@ -980,6 +1102,7 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
           PAGES: https://${{ github.repository_owner }}.github.io/cert-manager-webhook-freemyip
         run: |
           set -euo pipefail
@@ -1019,6 +1142,8 @@ jobs:
           [ "$got_v" = "$VERSION" ]   || { echo "::error::the published chart is version ${got_v}, expected ${VERSION}"; fail=1; }
           [ "$got_av" = "$VERSION" ]  || { echo "::error::the published chart has appVersion ${got_av}, expected ${VERSION} — it would pull the wrong image"; fail=1; }
           [ "$got_img" = "$HUB_IMAGE" ] || { echo "::error::the published chart points at ${got_img}, expected ${HUB_IMAGE}"; fail=1; }
+          got_dg=$(tar -xzOf chart.tgz cert-manager-webhook-freemyip/values.yaml | yq -r '.image.digest')
+          [ "$got_dg" = "$DIGEST" ] || { echo "::error::the published chart pins ${got_dg}, expected ${DIGEST}"; fail=1; }
           [ "$fail" = "0" ] || exit 1
 
           echo "${PAGES} serves ${VERSION}: chart ${got_v}, appVersion ${got_av}, image ${got_img}"
@@ -1056,23 +1181,33 @@ jobs:
               echo "${name} unchanged"
               continue
             fi
+            # Fatal, not a warning. The pages are part of the release's metadata,
+            # and the Docker Hub version tag is only committed once all of that
+            # succeeded — a page that silently failed to publish would let an
+            # immutable tag be committed alongside a stale page.
             sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha' 2>/dev/null || true)
             if [ -n "$sha" ]; then
-              gh api -X PUT "repos/${REPO}/contents/${name}" \
-                -f message="Update ${name} for ${VERSION}" \
-                -f content="$local_b64" -f sha="$sha" -f branch=gh-pages >/dev/null \
-                && { echo "updated ${name}"; changed=1; } \
-                || echo "::warning::could not update ${name} on gh-pages"
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Update ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f sha="$sha" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not update ${name} on gh-pages"
+                exit 1
+              fi
+              echo "updated ${name}"
             else
-              gh api -X PUT "repos/${REPO}/contents/${name}" \
-                -f message="Add ${name}" \
-                -f content="$local_b64" -f branch=gh-pages >/dev/null \
-                && { echo "added ${name}"; changed=1; } \
-                || echo "::warning::could not add ${name} to gh-pages"
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Add ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not add ${name} to gh-pages"
+                exit 1
+              fi
+              echo "added ${name}"
             fi
+            changed=1
           done
-          [ "$changed" = "0" ] && echo "page sources already current"
-          exit 0
+          if [ "$changed" = "0" ]; then
+            echo "page sources already current"
+          fi
 
   github_release:
     name: "Create GitHub release"
@@ -1099,7 +1234,7 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: chart
+          name: chart-release
 
       # gh release create makes the tag, so nothing pushes a ref before the
       # artifacts are actually published.
@@ -1246,10 +1381,11 @@ jobs:
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create --tag "${GHCR_IMAGE}:latest" "${GHCR_IMAGE}:${VERSION}"
-          docker buildx imagetools create --tag "${HUB_IMAGE}:latest"  "${HUB_IMAGE}:${VERSION}"
+          docker buildx imagetools create --tag "${GHCR_IMAGE}:latest" "${GHCR_IMAGE}@${DIGEST}"
+          docker buildx imagetools create --tag "${HUB_IMAGE}:latest"  "${HUB_IMAGE}@${DIGEST}"
           echo "latest now points at ${VERSION} on both registries"
 
       # Read back, for the same reason the index is read back: this job's
@@ -1259,13 +1395,16 @@ jobs:
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
         run: |
           set -euo pipefail
           # Both registries. Checking only one would let the other sit on the
           # previous release indefinitely, which is precisely the inconsistency
           # this job exists to close.
           for img in "$GHCR_IMAGE" "$HUB_IMAGE"; do
-            v=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${img}:${VERSION}")
+            # The digest, not ${img}:${VERSION}: the Docker Hub version tag is
+            # created last, by commit_tag, so it does not exist yet.
+            v="$DIGEST"
             l=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${img}:latest")
             if [ "$v" != "$l" ]; then
               echo "::error::${img}:latest resolves to ${l}, expected ${v} (${VERSION})"
@@ -1282,6 +1421,8 @@ jobs:
     # reusable workflow falls back on its own.
     needs: [resolve, release_approval, promote_latest, post_release_report]
     if: always() && needs.promote_latest.result == 'success'
+    permissions:
+      contents: read
     uses: ./.github/workflows/update_dockerhub_description.yaml
     with:
       version: ${{ needs.resolve.outputs.version }}
@@ -1398,10 +1539,17 @@ jobs:
             exit 0
           fi
 
+          # Fatal, like every other write before the Docker Hub tag is committed:
+          # the issues are part of the CVE list this release publishes. A failed
+          # listing used to read as "no open issues" and open duplicates of all
+          # of them; a failed create or comment used to be ignored because the
+          # loop ran in a pipe's subshell with nothing checking it.
           open_issues=$(gh issue list --repo "$REPO" --label security --state open \
-            --json number,title --limit 100 2>/dev/null || echo "[]")
+            --json number,title --limit 100) \
+            || { echo "::error::cannot list the open security issues"; exit 1; }
 
-          echo "$cves" | while read -r cve; do
+          failed=0
+          while read -r cve; do
             [ -z "$cve" ] && continue
             row=$(jq -r --arg cve "$cve" '
               .Results[]?.Vulnerabilities[]? |
@@ -1421,15 +1569,18 @@ jobs:
 
             if [ -n "$existing" ]; then
               gh issue comment "$existing" --repo "$REPO" \
-                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`."
+                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`." \
+                || { echo "::error::could not comment on #${existing} for ${cve}"; failed=1; }
             else
               body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**Detected in release:** `%s`\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
                 "$cve" "$severity" "$pkg" "$fixed" "$TAG" "$cve")
               gh issue create --repo "$REPO" \
                 --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
-                --body "$body" --label "$labels"
+                --body "$body" --label "$labels" \
+                || { echo "::error::could not open an issue for ${cve}"; failed=1; }
             fi
-          done
+          done < <(printf '%s\n' "$cves")
+          exit "$failed"
 
 
   # Separated from the job above on purpose. `contents: write` is the permission
@@ -1452,11 +1603,12 @@ jobs:
         with:
           name: scan-pages
 
-      # Deliberately not fatal. The release is published and correct by this
-      # point, and failing here would mark a good release red over a
-      # documentation commit — the warning is the signal, not the exit code.
+      # Fatal. This used to run after a finished release, where a warning was
+      # the right signal. It now runs before the Docker Hub version tag is
+      # committed, and the scan is part of what that tag is bound to: if the
+      # README cannot show it, the tag must not be created, and the rollback
+      # takes back the rest.
       - name: Commit the scan onto the default branch
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1465,11 +1617,8 @@ jobs:
         run: |
           set -uo pipefail
           for f in README.md docs/dockerhub_description.md; do
-            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}" 2>/dev/null || true)
-            if [ -z "$meta" ]; then
-              echo "::warning::${f} not found on ${BRANCH} — skipped"
-              continue
-            fi
+            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}") \
+              || { echo "::error::cannot read ${f} on ${BRANCH}"; exit 1; }
             sha=$(printf '%s' "$meta" | jq -r '.sha')
             # Identical content would mean an empty commit, which the API
             # rejects — and a release that changed nothing on the page is a
@@ -1486,98 +1635,36 @@ jobs:
                  -f sha="$sha" -f branch="$BRANCH" >/dev/null; then
               echo "updated ${f} on ${BRANCH}"
             else
-              echo "::warning::could not update ${f} on ${BRANCH}"
+              echo "::error::could not update ${f} on ${BRANCH}"
+              exit 1
             fi
           done
 
-
-  # Ungated on purpose, and it runs before the deletion job. A reviewer facing
-  # an approval prompt after a failed release needs to know that approving
-  # deletes tags rather than publishing anything.
-  # Only offered when the push actually started. A rejected approval fails the
-  # workflow exactly as a broken build does, so gating this on failure() asked
-  # for a second approval after every rejection — a question about deleting tags
-  # that were never pushed. push_attempted is the only thing that tells the two
-  # apart; cancelled() is kept because a job cancelled mid-push never gets to
-  # publish its outputs.
-  cleanup_notice:
-    name: "Pending: approve to delete partially published tags"
-    needs: [resolve, publish_image]
-    # Both halves are required. push_attempted alone is true on a *successful*
-    # release too, which would park a "approve to delete" prompt after every
-    # clean release — and approving it would delete the version just published.
-    # failure()/cancelled() alone was the original bug: a rejected approval
-    # fails the workflow identically to a broken build, so it asked to delete
-    # tags that were never pushed.
-    #
-    # It now keys off publish_image rather than the build, because that is the
-    # first job that can put a version tag on Docker Hub. A failure anywhere
-    # before it leaves nothing there to delete.
+  # THE COMMIT. The Docker Hub version tag, and nothing after it.
+  #
+  # Docker Hub version tags are immutable: once created, neither overwritable nor
+  # deletable. So this is the one write that cannot be taken back, and it runs
+  # only after every other write of the release has succeeded — the image by
+  # digest, the OCI chart, the index, the GitHub release, latest, the scan, the
+  # pages. Until it succeeds everything is reversible, and `rollback` below
+  # reverses it; once it succeeds there is nothing left to fail. The tag and
+  # the release's metadata succeed together or not at all.
+  #
+  # Content is already on Docker Hub by digest, so this writes one small index
+  # manifest and nothing else.
+  commit_tag:
+    name: "Commit: create the Docker Hub version tag"
+    needs: [resolve, publish_image, publish_chart_oci, publish_chart_index, github_release, promote_latest, post_release_report, record_scan, dockerhub_description]
     if: |
-      always() && needs.resolve.result == 'success' &&
-      needs.publish_image.outputs.push_attempted == 'true' &&
-      (failure() || cancelled())
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-      - name: Explain the pending approval
-        env:
-          VERSION: ${{ needs.resolve.outputs.version }}
-          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
-        run: |
-          {
-            echo "## Action required: approve Docker Hub tag deletion"
-            echo ""
-            echo "The push to Docker Hub started and the release did not finish."
-            echo "You are seeing this only because tags may actually exist — a"
-            echo "rejected release does not reach this point."
-            echo ""
-            echo "**The next approval DELETEs one tag. It is not a new release attempt.**"
-            echo ""
-            echo "Tag that will be deleted from \`${HUB_REPO}\` if it exists:"
-            echo ""
-            echo "- \`${VERSION}\`"
-            echo ""
-            echo "\`latest\` was never moved. It only moves after the release gate"
-            echo "passes, so it still points at the last good release."
-            echo ""
-            echo "No git tag was created — this workflow creates it last, with the GitHub release — so"
-            echo "there is nothing to unwind on the repository side."
-            echo ""
-            echo "Review deployments → release → Approve and deploy, to proceed with deletion."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # The approval, separated from the deletion for the same reason the release
-  # is: the job that asks carries the reviewer, the job that acts carries the
-  # credential. cleanup_notice above stays ungated so its explanation is
-  # readable *before* this prompt appears, not after it is answered.
-  cleanup_confirm:
-    name: "⚠️ Approve to DELETE partially published tags — NOT a release"
-    needs: [resolve, cleanup_notice]
-    if: always() && needs.cleanup_notice.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release-approval
-    permissions:
-      contents: read
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-      - name: Record the decision
-        env:
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: echo "deletion of ${VERSION} approved"
-
-  cleanup_dockerhub:
-    name: "Delete the partially published tags"
-    needs: [resolve, cleanup_confirm]
-    if: always() && needs.cleanup_confirm.result == 'success'
+      always() &&
+      needs.publish_image.result == 'success' &&
+      needs.publish_chart_oci.result == 'success' &&
+      needs.publish_chart_index.result == 'success' &&
+      needs.github_release.result == 'success' &&
+      needs.promote_latest.result == 'success' &&
+      needs.post_release_report.result == 'success' &&
+      needs.record_scan.result == 'success' &&
+      needs.dockerhub_description.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -1587,62 +1674,92 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      # Refuse to delete an image something still points at. This job exists for
-      # a failure before the index moved, where the version tag is stranded and
-      # unreferenced. If the run got far enough to publish the index, deleting
-      # the image here would leave the index advertising a chart whose image is
-      # gone — the exact state the publication order exists to prevent. That
-      # case needs the full reverse-order unwind, which withdraw_release does.
-      - name: Refuse if the chart index still advertises this version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -uo pipefail
-          idx=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null || echo "")
-          if [ -n "$idx" ] && printf '%s' "$idx" | base64 -d | grep -q "version: ${VERSION}\$"; then
-            echo "::error::the chart repository index still advertises ${VERSION}. Deleting the image now would break every install that reads the index. Run the 'Withdraw a release' workflow instead — it removes the index entry first."
-            exit 1
-          fi
-          echo "nothing advertises ${VERSION} — safe to delete the stranded tag"
-      # Docker Hub publishes tag by tag, so a cancel or a failure mid-push can
-      # leave a half-released version behind. ghcr is not cleaned up here: its
-      # versioned tags are overwritable, so a retry corrects them.
-      - name: Delete the tags this run may have pushed
+      - name: Log in to Docker Hub
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          # hub_repo, not hub_image: the Hub web API addresses repositories as
-          # owner/name, with no registry prefix.
-          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
-          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          set -uo pipefail
-          if [ -z "${VERSION:-}" ]; then
-            echo "no version resolved — nothing this run could have pushed"
-            exit 0
-          fi
-          # Trimmed for the same reason as the login above: a newline inside the
-          # JSON string below makes the body invalid, and the API just refuses.
-          # Case is left exactly as stored.
-          HUB_USER=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
-          HUB_PAT=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
-          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PAT}\"}" \
-            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
-          if [ -z "$jwt" ]; then
-            echo "could not authenticate to the Docker Hub API — delete the tags by hand"
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
             exit 1
           fi
-          # The version tag only. `latest` is the mutable production pointer: if
-          # this run failed part-way, latest still points at the previous good
-          # release, and deleting it would take that release's pointer with it.
-          # A retry overwrites latest anyway. docker-nginx-lego excludes it for
-          # the same reason.
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" \
-            -H "Authorization: Bearer ${jwt}")
-          echo "delete ${HUB_REPO}:${VERSION} -> ${code}"
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
+
+      # Decided by what Docker Hub serves afterwards, not by the exit status of
+      # the create: a create that reports failure after the tag landed must not
+      # send the release into a rollback that could no longer remove it.
+      - name: Create the version tag on the published digest
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          set -uo pipefail
+          tag_digest() {
+            curl -s --retry 3 --retry-all-errors --max-time 30 \
+              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" | jq -r '.digest // empty'
+          }
+          have=$(tag_digest)
+          if [ -z "$have" ]; then
+            docker buildx imagetools create --tag "${HUB_IMAGE}:${VERSION}" "${HUB_IMAGE}@${DIGEST}" \
+              || echo "::warning::the create reported failure — checking what Docker Hub now serves"
+            have=$(tag_digest)
+          fi
+          if [ "$have" = "$DIGEST" ]; then
+            echo "committed: ${HUB_IMAGE}:${VERSION} -> ${DIGEST}"
+          elif [ -z "$have" ]; then
+            echo "::error::${HUB_IMAGE}:${VERSION} was not created. Nothing irreversible happened; the rollback below reverts the rest."
+            exit 1
+          else
+            echo "::error::${HUB_IMAGE}:${VERSION} points at ${have}, not ${DIGEST}. Something else created this tag."
+            exit 1
+          fi
+
+      - name: Summarise
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          {
+            echo "### Committed \`${VERSION}\`"
+            echo ""
+            echo "\`${HUB_IMAGE}:${VERSION}\` now names \`${DIGEST}\`. Every other"
+            echo "part of the release was published and verified before this tag existed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ROLLBACK. Anything after the first push that fails before the commit is
+  # reverted by the same workflow that withdraws a finished release, so there
+  # is one path back and it is the reverse of publication order. It asks for its
+  # own approval before deleting anything, and skips whatever was never
+  # published. The Docker Hub version tag cannot be among what it finds: that
+  # tag only exists once commit_tag has succeeded, and then this does not run.
+  #
+  # A called workflow can only narrow the token, never widen it, so this grants
+  # the union of what the withdraw jobs need; each job there declares its own,
+  # smaller, set.
+  rollback:
+    name: "Roll back the unfinished release"
+    needs: [resolve, publish_image, commit_tag]
+    if: |
+      always() && needs.resolve.result == 'success' &&
+      (needs.publish_image.outputs.push_attempted == 'true' || needs.publish_image.result == 'cancelled') &&
+      needs.commit_tag.result != 'success'
+    permissions:
+      contents: write
+      issues: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/withdraw_release.yaml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      confirm: ${{ needs.resolve.outputs.version }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
