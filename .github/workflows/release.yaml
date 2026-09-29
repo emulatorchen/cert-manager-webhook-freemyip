@@ -13,10 +13,17 @@ name: release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, without the leading v (e.g. 0.2.0). Blank uses the chart appVersion."
-        required: false
-        default: ""
+      # No version input. Like docker-nginx-lego, the release works its own
+      # version out; unlike it, this project has a real semver, so the only
+      # choice left to a person is how far to move it.
+      bump:
+        description: "How to move from the last published release: patch (0.1.0 → 0.1.1), minor (→ 0.2.0) or major (→ 1.0.0)"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
       notes:
         description: "Release notes. Blank auto-generates them from merged pull requests; text is prepended before the generated notes unless override is checked."
         required: false
@@ -71,30 +78,45 @@ jobs:
 
       # ghcr.io rejects uppercase in repository names, but github.repository
       # and github.repository_owner preserve the owner's casing.
+      # The version is worked out, never typed — docker-nginx-lego's model,
+      # carried over and tightened:
+      #
+      # - It counts from the last PUBLISHED release, not from tags. A draft, a
+      #   pre-release, or an attempt that was rolled back publishes nothing, so
+      #   the next run computes the same number again. Failed attempts never
+      #   advance the version (lego pushes its tag in this first job, before
+      #   any approval, so a rejected run still consumes one).
+      # - Nothing is written here. The tag appears with the GitHub release,
+      #   after the approval, and the rollback removes it.
+      # - The chart's version is stamped at packaging time, as the digest is,
+      #   so there is no second copy of the number to keep in step.
       - name: Resolve version and targets
         id: v
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          version="$INPUT_VERSION"
-          if [ -z "$version" ]; then
-            version=$(grep -m1 '^appVersion:' charts/cert-manager-webhook-freemyip/Chart.yaml \
-                      | sed 's/^appVersion:[[:space:]]*//; s/"//g')
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+                     --limit 100 --json tagName --jq '.[].tagName' \
+                   | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            version="0.1.0"
+            echo "no published release yet — starting at ${version}"
+          else
+            IFS=. read -r major minor patch <<< "$latest"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="${major}.$((minor + 1)).0" ;;
+              patch) version="${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::unknown bump '${BUMP}'"; exit 1 ;;
+            esac
+            echo "last published release ${latest}, ${BUMP} bump -> ${version}"
           fi
-          [ -n "$version" ] || { echo "could not resolve a version"; exit 1; }
-
-          # The chart repository publishes whatever Chart.yaml's `version:`
-          # says — it does not see this input. If the two disagree, the images
-          # and the GitHub release carry one number while `helm repo add` users
-          # get another. Caught here rather than discovered in the index.
-          chart_version=$(grep -m1 '^version:' charts/cert-manager-webhook-freemyip/Chart.yaml \
-                          | sed 's/^version:[[:space:]]*//; s/"//g')
-          if [ "$chart_version" != "$version" ]; then
-            echo "::error::releasing ${version} but Chart.yaml says version: ${chart_version}. The chart repository would publish ${chart_version}. Update Chart.yaml, or release the version it already names."
-            exit 1
-          fi
+          # Exactly X.Y.Z: it is also what Docker Hub's immutability rule matches.
+          printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::'${version}' is not X.Y.Z"; exit 1; }
           if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
             echo "tag v${version} already exists — bump the version, or delete the tag to re-release"
             exit 1
@@ -1016,14 +1038,28 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # chart-releaser packages from the checkout, so the digest is pinned into
-      # the checkout — the same value the OCI chart carries.
-      - name: Pin the chart to the published digest
+      # chart-releaser packages from the checkout, so the version and the digest
+      # are stamped into the checkout — the same values the OCI chart carries.
+      # `helm package --version` does this for the OCI chart; chart-releaser has
+      # no such option, so Chart.yaml itself is set.
+      - name: Stamp the chart with the release version and digest
         if: steps.pages.outputs.present == 'true'
         env:
           DIGEST: ${{ needs.publish_image.outputs.digest }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
+          c=charts/cert-manager-webhook-freemyip/Chart.yaml
+          for key in version appVersion; do
+            [ "$(grep -c "^${key}:" "$c")" = "1" ] \
+              || { echo "::error::expected exactly one ${key}: line in ${c}"; exit 1; }
+          done
+          sed -i -E "s|^version:.*$|version: ${VERSION}|; s|^appVersion:.*$|appVersion: \"${VERSION}\"|" "$c"
+          if [ "$(yq -r '.version' "$c")" != "$VERSION" ] || [ "$(yq -r '.appVersion' "$c")" != "$VERSION" ]; then
+            echo "::error::Chart.yaml was not stamped with ${VERSION}"
+            exit 1
+          fi
+
           printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
             || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
           # One line, in place. yq would re-serialise the whole file — dropping
