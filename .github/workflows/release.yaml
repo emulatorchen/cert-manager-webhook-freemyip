@@ -1108,18 +1108,34 @@ jobs:
           set -euo pipefail
           command -v yq >/dev/null 2>&1 || { echo "::error::yq is not available on this runner"; exit 1; }
 
-          # 1. the index is fetchable over the URL `helm repo add` is given
-          curl -fsSL --retry 3 --retry-all-errors --max-time 60 "${PAGES}/index.yaml" -o index.yaml \
-            || { echo "::error::${PAGES}/index.yaml is not fetchable. helm repo add would fail."; exit 1; }
-
-          # 2. it has an entry for this version, and that entry names a file
-          url=$(V="$VERSION" yq -r \
-            '.entries["cert-manager-webhook-freemyip"][] | select(.version == strenv(V)) | .urls[0] // ""' \
-            index.yaml)
-          if [ -z "$url" ]; then
-            echo "::error::index.yaml has no entry for ${VERSION}. The chart repository was not updated, so helm repo add users would not see this release."
-            exit 1
-          fi
+          # 1 and 2. the index is fetchable over the URL `helm repo add` is given,
+          #    and it has an entry for this version that names a file.
+          #
+          # Polled, bounded, not checked once. GitHub Pages republishes the
+          # branch asynchronously after the push: the first 0.1.1 attempt read
+          # the index one second after the commit, while the Pages build was
+          # still starting (it took 47s), saw the previous site and failed a
+          # release that had published correctly. The query string defeats the
+          # Pages CDN cache, which would otherwise serve the old file for up to
+          # ten minutes after the build.
+          deadline=$(( $(date +%s) + 600 ))
+          url=""
+          while :; do
+            if curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+                 "${PAGES}/index.yaml?release=${VERSION}&t=$(date +%s)" -o index.yaml; then
+              url=$(V="$VERSION" yq -r \
+                '.entries["cert-manager-webhook-freemyip"][] | select(.version == strenv(V)) | .urls[0] // ""' \
+                index.yaml)
+              [ -n "$url" ] && break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::after 10 minutes ${PAGES}/index.yaml still has no entry for ${VERSION}. The chart repository was not updated, so helm repo add users would not see this release."
+              exit 1
+            fi
+            echo "Pages does not serve ${VERSION} yet — waiting for the site to republish"
+            sleep 15
+          done
+          echo "Pages serves ${VERSION}"
           case "$url" in
             http*) full="$url" ;;
             *)     full="${PAGES}/${url}" ;;
