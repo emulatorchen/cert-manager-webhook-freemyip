@@ -70,6 +70,13 @@ for the wrong domain therefore fails silently: the API answers `OK`, the solver
 reports success, and validation never finds the record. Each freemyip domain has
 its own token — check the token matches the domain you are issuing for.
 
+## Vulnerability scan
+
+<!-- scan:begin -->
+_Populated by the release workflow. Until the first release publishes one, there
+is no scan to show here._
+<!-- scan:end -->
+
 ## Requirements
 
 - cert-manager ≥ v1.8.0 in the cluster

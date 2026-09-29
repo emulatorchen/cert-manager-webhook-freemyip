@@ -22,6 +22,8 @@ jobs:
     outputs:
       go: ${{ steps.filter.outputs.go }}
       image: ${{ steps.filter.outputs.image }}
+    permissions:
+      contents: read
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -48,6 +50,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # Audits what the job talks to, so an action that starts reaching
       # somewhere new is visible rather than silent.
@@ -135,6 +139,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.go == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -169,6 +175,8 @@ jobs:
     needs: [build, image, test]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check results
         env:

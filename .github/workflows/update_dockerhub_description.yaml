@@ -25,16 +25,26 @@ on:
         required: false
         type: string
         default: ""
+      page_artifact:
+        description: "Artifact holding the page already composed by the release, with its vulnerability scan rendered in."
+        required: false
+        type: string
+        default: ""
     # Declared explicitly rather than using `secrets: inherit`, so the caller
     # hands over this one value and nothing else.
     #
-    # DOCKERHUB_PASSWORD is declared only to satisfy actionlint, which models
-    # the secrets context of a called workflow as exactly this list and does not
-    # know about environment secrets. The caller never passes it and could not
-    # usefully do so: GitHub's rule is that when a called workflow's job declares
-    # an environment, "the environment secret will be used, and not the secret
-    # passed from the caller workflow". So the value always comes from
-    # dockerhub-metadata, and a caller cannot substitute its own.
+    # DOCKERHUB_PASSWORD is declared but never passed. GitHub's documented rule
+    # is that when a called workflow's job declares an environment, the
+    # environment secret wins over anything the caller sends — so the value is
+    # meant to come from dockerhub-metadata and a caller cannot substitute one.
+    # actionlint models the secrets context as exactly this list and has no
+    # concept of environment secrets, so removing the declaration only trades a
+    # runtime question for a lint error.
+    #
+    # Release #6 read an empty value here and skipped silently. Which of the two
+    # values was empty was not recoverable from the log, because the check said
+    # "A or B". It now names the one that is missing and fails outright on a
+    # release, so the next run answers the question instead of hiding it.
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -64,6 +74,17 @@ jobs:
     # else. Give that environment a required reviewer too, so every use of the
     # account password is a deliberate click.
     environment: dockerhub-metadata
+    # Defined once and used both to publish and to verify. Two copies of this
+    # string would let the page say one thing while the check asserted another,
+    # which is the same shape of fault as a green job that wrote nothing.
+    #
+    # Docker Hub indexes this line and shows it in search results, so it carries
+    # the terms someone would actually search for. The limit is 100 characters.
+    env:
+      SHORT_DESC: "cert-manager DNS-01 webhook solver for freemyip.com — Let's Encrypt wildcards on k8s"
+      README_PATH: ./docs/dockerhub_description.md
+    permissions:
+      contents: read
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -73,17 +94,58 @@ jobs:
         with:
           persist-credentials: false
 
-      # Skip rather than fail while the secret is unset, so this does not sit
-      # red on main before the password has been added.
+      # The release renders the vulnerability scan into this page and hands the
+      # result over as an artifact. It has to come from there rather than from
+      # the checkout: this job checks out the commit the run started from, which
+      # cannot contain the scan of the release that run is publishing.
+      #
+      # Optional and non-fatal — a dispatched run has no artifact, and a release
+      # whose scan step failed should still get its page refreshed with what is
+      # committed.
+      - name: Take the page composed by the release
+        if: inputs.page_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.page_artifact }}
+          # The artifact carries both pages at their repository paths, so this
+          # lands docs/dockerhub_description.md exactly where README_PATH points.
+          path: .
+
+      - name: Note whether the page carries a scan
+        run: |
+          if grep -q 'Populated by the release workflow' "$README_PATH"; then
+            echo "::warning::the page still holds the placeholder — Docker Hub will show no vulnerability scan"
+          else
+            echo "the page carries a rendered scan"
+          fi
+
+      # Skipping when unconfigured was written for the period before the
+      # password existed. It then hid a live failure for a whole release: the
+      # value arrived empty, this step skipped, and a job named "Update Docker
+      # Hub description" went green having updated nothing.
+      #
+      # So it now skips only when nothing depends on it. A release passes
+      # `version`, and on a release the configuration must be there — a missing
+      # value is a failure, named, not a shrug. It says *which* value is
+      # missing, because "A or B not set" is not something anyone can act on.
       - name: Check configuration
         id: check
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          RELEASING: ${{ inputs.version }}
         run: |
-          if [ -z "$HUB_PW" ] || [ -z "$HUB_REPO" ]; then
-            echo "DOCKERHUB_PASSWORD or DOCKERHUB_REPOSITORY not set — skipping"
+          missing=""
+          [ -z "$HUB_PW" ] && missing="${missing} DOCKERHUB_PASSWORD(environment dockerhub-metadata)"
+          [ -z "$HUB_REPO" ] && missing="${missing} DOCKERHUB_REPOSITORY(repository variable)"
+          if [ -n "$missing" ]; then
+            if [ -n "$RELEASING" ]; then
+              echo "::error::not set:${missing}. A release refreshes this page, so this cannot be skipped."
+              exit 1
+            fi
+            echo "::warning::not set:${missing} — skipping. Set them, then dispatch this workflow again."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -122,8 +184,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           "password": ${{ secrets.DOCKERHUB_PASSWORD }}
           repository: ${{ vars.DOCKERHUB_REPOSITORY }}
-          readme-filepath: ./docs/dockerhub_description.md
-          short-description: "cert-manager ACME DNS-01 webhook solver for freemyip.com"
+          readme-filepath: ${{ env.README_PATH }}
+          short-description: ${{ env.SHORT_DESC }}
 
       # The source link on the Hub page. Set here as well as in the release, so
       # it is correct even before the first release exists.
@@ -155,6 +217,49 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"vcs_url\":\"https://github.com/${REPO}\"}")
           echo "vcs_url update -> ${code}"
+
+      # The page is what this job exists to change, so its success has to mean
+      # the page now holds what we sent. "Not empty" would pass on a stale page,
+      # a truncated upload, or somebody else's text — the action can only report
+      # what it transmitted, never what Docker Hub stored.
+      - name: Verify the page matches what was published
+        if: steps.check.outputs.skip != 'true'
+        env:
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          set -uo pipefail
+          body=$(curl -sS --retry 3 --retry-all-errors --max-time 30 \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/" || echo "")
+          if [ -z "$body" ]; then
+            echo "::error::could not read the Docker Hub repository back — cannot confirm the page was updated"
+            exit 1
+          fi
+
+          # $( ) strips trailing newlines from both sides, so a difference in
+          # the final newline alone is not reported as a mismatch.
+          want=$(cat "$README_PATH")
+          got=$(printf '%s' "$body" | jq -r '.full_description // ""')
+          if [ "$got" != "$want" ]; then
+            echo "::error::the Docker Hub page does not match ${README_PATH} (sent ${#want} chars, page has ${#got})"
+            echo "First differences (< expected, > on the page):"
+            diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | head -20
+            exit 1
+          fi
+
+          got_short=$(printf '%s' "$body" | jq -r '.description // ""')
+          if [ "$got_short" != "$SHORT_DESC" ]; then
+            echo "::error::the Docker Hub short description is '${got_short}', expected '${SHORT_DESC}'"
+            exit 1
+          fi
+
+          # The source link is set by the step above; a 403 there is reported as
+          # a warning, so confirm the value rather than assuming it took.
+          got_vcs=$(printf '%s' "$body" | jq -r '.vcs_url // ""')
+          want_vcs="https://github.com/${GITHUB_REPOSITORY}"
+          [ "$got_vcs" = "$want_vcs" ] \
+            || echo "::warning::vcs_url is '${got_vcs}', expected '${want_vcs}'"
+
+          echo "Docker Hub page matches ${README_PATH} (${#want} characters) and the short description"
 
       - name: Summarise
         if: always()

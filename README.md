@@ -1,5 +1,12 @@
 # cert-manager-webhook-freemyip
 
+**Let's Encrypt wildcard certificates for a freemyip.com domain, on Kubernetes.**
+
+[![Release](https://img.shields.io/github/v/release/emulatorchen/cert-manager-webhook-freemyip?label=release&sort=semver)](https://github.com/emulatorchen/cert-manager-webhook-freemyip/releases)
+[![Docker Hub](https://img.shields.io/docker/v/emulator/cert-manager-webhook-freemyip?label=docker%20hub&sort=semver)](https://hub.docker.com/r/emulator/cert-manager-webhook-freemyip)
+[![Helm chart](https://img.shields.io/badge/helm-chart%20repository-0f1689)](https://emulatorchen.github.io/cert-manager-webhook-freemyip)
+[![License](https://img.shields.io/github/license/emulatorchen/cert-manager-webhook-freemyip)](LICENSE)
+
 A [cert-manager](https://cert-manager.io) ACME DNS-01 webhook solver for
 [freemyip.com](https://freemyip.com) dynamic DNS.
 
@@ -132,6 +139,45 @@ spec:
 | `image.repository` | `docker.io/emulator/cert-manager-webhook-freemyip` | Image registry path |
 | `image.tag` | `""` | Image tag; empty uses the chart `appVersion` |
 | `groupName` | `acme.freemyip.emulatorchen.github.com` | Webhook group name (must be unique) |
+
+## Vulnerability scan
+
+<!-- scan:begin -->
+_Populated by the release workflow. Until the first release publishes one, there
+is no scan to show here._
+<!-- scan:end -->
+
+## Common questions
+
+**Can it issue wildcard certificates?**
+Yes. DNS-01 is the only challenge type Let's Encrypt accepts for a wildcard
+name, and this solver performs DNS-01, so a Certificate listing both
+`example.freemyip.com` and `*.example.freemyip.com` is issued normally.
+
+**Why does issuance fail when freemyip answered `OK`?**
+The token, not the `domain` parameter, decides where the record is published.
+A token for the wrong domain fails silently — see [How it works](#how-it-works).
+
+**Do I have to use the Helm chart?**
+In practice, yes. cert-manager reaches the solver through an `APIService`, and
+the chart is what registers it along with the RBAC the webhook needs to read
+its Secret. Running the image on its own does nothing.
+
+**Which architectures are published?**
+`linux/amd64` and `linux/arm64`. Every published image carries a build
+provenance attestation and an SBOM; version tags are immutable, and `latest`
+moves only on a reviewed release.
+
+**Is it affiliated with freemyip.com, cert-manager or Let's Encrypt?**
+No. It is an independent webhook solver that talks to the public freemyip API.
+
+## Links
+
+- [Helm chart repository](https://emulatorchen.github.io/cert-manager-webhook-freemyip)
+- [Docker Hub](https://hub.docker.com/r/emulator/cert-manager-webhook-freemyip)
+- [GitHub Container Registry](https://github.com/emulatorchen/cert-manager-webhook-freemyip/pkgs/container/cert-manager-webhook-freemyip)
+- [Releases and changelog](https://github.com/emulatorchen/cert-manager-webhook-freemyip/releases)
+- [cert-manager webhook solver documentation](https://cert-manager.io/docs/configuration/acme/dns01/webhook/)
 
 ## License
 

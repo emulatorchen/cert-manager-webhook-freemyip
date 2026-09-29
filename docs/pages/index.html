@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>cert-manager webhook for freemyip.com — Helm chart repository</title>
+<meta name="description" content="Helm chart and container images for the cert-manager ACME DNS-01 webhook solver for freemyip.com dynamic DNS. Issue Let's Encrypt certificates, including wildcards, for a freemyip domain in Kubernetes.">
+<link rel="canonical" href="https://emulatorchen.github.io/cert-manager-webhook-freemyip/">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="author" content="emulatorchen">
+<meta name="keywords" content="cert-manager, freemyip, DNS-01, ACME, Let's Encrypt, Kubernetes, Helm chart, wildcard certificate, webhook solver, dynamic DNS">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="cert-manager-webhook-freemyip">
+<meta property="og:title" content="cert-manager webhook for freemyip.com — Helm chart repository">
+<meta property="og:description" content="Issue Let's Encrypt certificates, including wildcards, for a freemyip.com domain in Kubernetes, using the cert-manager ACME DNS-01 protocol.">
+<meta property="og:url" content="https://emulatorchen.github.io/cert-manager-webhook-freemyip/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="cert-manager webhook for freemyip.com">
+<meta name="twitter:description" content="Helm chart and images for the cert-manager DNS-01 webhook solver for freemyip.com dynamic DNS.">
+
+<!-- Structured metadata, so the chart, its licence and the common questions
+     below can be read without parsing the prose. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://emulatorchen.github.io/cert-manager-webhook-freemyip/#app",
+      "name": "cert-manager-webhook-freemyip",
+      "alternateName": "cert-manager webhook solver for freemyip.com",
+      "description": "A cert-manager ACME DNS-01 webhook solver for freemyip.com dynamic DNS, letting Let's Encrypt issue certificates — including wildcards — for a freemyip domain.",
+      "applicationCategory": "DeveloperApplication",
+      "applicationSubCategory": "Kubernetes operator add-on",
+      "operatingSystem": "Kubernetes (linux/amd64, linux/arm64)",
+      "url": "https://emulatorchen.github.io/cert-manager-webhook-freemyip/",
+      "downloadUrl": "https://emulatorchen.github.io/cert-manager-webhook-freemyip/",
+      "codeRepository": "https://github.com/emulatorchen/cert-manager-webhook-freemyip",
+      "programmingLanguage": "Go",
+      "license": "https://www.apache.org/licenses/LICENSE-2.0",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "author": { "@type": "Person", "name": "emulatorchen", "url": "https://github.com/emulatorchen" },
+      "softwareRequirements": "cert-manager v1.8.0 or later; a registered freemyip.com domain and its API token"
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "name": "cert-manager-webhook-freemyip",
+      "codeRepository": "https://github.com/emulatorchen/cert-manager-webhook-freemyip",
+      "programmingLanguage": "Go",
+      "license": "https://www.apache.org/licenses/LICENSE-2.0",
+      "about": { "@id": "https://emulatorchen.github.io/cert-manager-webhook-freemyip/#app" }
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What does cert-manager-webhook-freemyip do?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It implements the cert-manager external DNS solver protocol for freemyip.com. cert-manager calls it to publish and remove the _acme-challenge TXT record that Let's Encrypt reads to verify domain ownership, which is what makes DNS-01 issuance — and therefore wildcard certificates — possible for a freemyip domain."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I install it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "helm repo add cert-manager-webhook-freemyip https://emulatorchen.github.io/cert-manager-webhook-freemyip && helm repo update, then helm upgrade --install cert-manager-webhook-freemyip cert-manager-webhook-freemyip/cert-manager-webhook-freemyip --namespace cert-manager -f values.yaml. The chart is also published as an OCI artifact at oci://ghcr.io/emulatorchen/charts/cert-manager-webhook-freemyip."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can it issue wildcard certificates?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. DNS-01 is the only ACME challenge type Let's Encrypt accepts for wildcard names, and this solver performs DNS-01, so a Certificate listing both example.freemyip.com and *.example.freemyip.com is issued normally."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does issuance fail even though freemyip answered OK?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "freemyip applies an update to whichever domain the token owns and publishes at _acme-challenge under that domain, whatever the domain parameter says. A token for the wrong domain therefore fails silently: the API answers OK, the solver reports success, and validation never finds the record. Each freemyip domain has its own token, so check that the token matches the domain being issued for."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Where are the container images published?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "docker.io/emulator/cert-manager-webhook-freemyip and ghcr.io/emulatorchen/cert-manager-webhook-freemyip, built for linux/amd64 and linux/arm64. Every published image carries a build provenance attestation and an SBOM, and version tags are immutable."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I supply the freemyip API token?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Either set freemyip.token in a values file and let the chart create the Secret, or create a Secret yourself in the cert-manager namespace with a single key named token and point the chart at it with secret.existingSecret and secret.existingSecretName. Use a values file rather than --set: anything on the command line is visible in the process list to other users on the machine."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1c1e; --muted: #5a6169; --rule: #e3e6ea;
+    --code-bg: #f5f7f9; --link: #0a58ca; --accent: #0f6fc5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171a; --fg: #e6e9ec; --muted: #9aa4ae; --rule: #2a2f35;
+      --code-bg: #1c2024; --link: #6ea8fe; --accent: #6ea8fe;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg); margin: 0;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 16px 4rem; }
+  h1 { font-size: 1.75rem; line-height: 1.25; margin: 0 0 .5rem; }
+  h2 { font-size: 1.2rem; margin: 2.5rem 0 .75rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); }
+  h3 { font-size: 1rem; margin: 1.5rem 0 .4rem; }
+  p, li { color: var(--fg); }
+  .lede { font-size: 1.05rem; color: var(--muted); margin: 0 0 1.5rem; }
+  a { color: var(--link); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .875rem; }
+  code { background: var(--code-bg); padding: .12em .35em; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 1rem; border-radius: 8px; overflow-x: auto; border: 1px solid var(--rule); }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; display: block; overflow-x: auto; }
+  th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  footer { margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: .875rem; }
+  .links { list-style: none; padding: 0; margin: 1.25rem 0 0; }
+  .links li { margin: .35rem 0; }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>cert-manager webhook for freemyip.com</h1>
+  <p class="lede">
+    An ACME DNS-01 webhook solver that lets <a href="https://cert-manager.io">cert-manager</a>
+    issue Let's Encrypt certificates — including wildcards — for a
+    <a href="https://freemyip.com">freemyip.com</a> dynamic DNS domain.
+    This page is the Helm chart repository.
+  </p>
+
+  <h2 id="install">Install the chart</h2>
+  <pre><code>helm repo add cert-manager-webhook-freemyip \
+  https://emulatorchen.github.io/cert-manager-webhook-freemyip
+helm repo update
+
+helm upgrade --install cert-manager-webhook-freemyip \
+  cert-manager-webhook-freemyip/cert-manager-webhook-freemyip \
+  --namespace cert-manager -f values.yaml</code></pre>
+
+  <p>
+    The chart is also published as an OCI artifact, for clusters that prefer a registry
+    to a chart repository:
+  </p>
+  <pre><code>helm upgrade --install cert-manager-webhook-freemyip \
+  oci://ghcr.io/emulatorchen/charts/cert-manager-webhook-freemyip \
+  --namespace cert-manager -f values.yaml</code></pre>
+
+  <h3>A minimal values file</h3>
+  <pre><code>clusterIssuer:
+  email: you@example.com
+  staging:
+    create: true
+  production:
+    create: true</code></pre>
+
+  <p>
+    Supply the freemyip API token either by setting <code>freemyip.token</code> in that file,
+    or by creating a Secret yourself with a single key named <code>token</code> and pointing the
+    chart at it with <code>secret.existingSecret</code> and <code>secret.existingSecretName</code>.
+    Use a values file rather than <code>--set</code>: anything on the command line is visible
+    in the process list to every other user on the machine.
+  </p>
+
+  <h2 id="usage">Request a certificate</h2>
+  <pre><code>apiVersion: cert-manager.io/v1
+kind: Certificate
+spec:
+  secretName: example-tls
+  issuerRef:
+    name: cert-manager-webhook-freemyip-production
+    kind: ClusterIssuer
+  dnsNames:
+    - example.freemyip.com
+    - "*.example.freemyip.com"</code></pre>
+
+  <h2 id="images">Container images</h2>
+  <table>
+    <thead><tr><th>Registry</th><th>Image</th></tr></thead>
+    <tbody>
+      <tr><td>Docker Hub</td><td><code>docker.io/emulator/cert-manager-webhook-freemyip</code></td></tr>
+      <tr><td>GitHub Container Registry</td><td><code>ghcr.io/emulatorchen/cert-manager-webhook-freemyip</code></td></tr>
+    </tbody>
+  </table>
+  <p>
+    Built for <code>linux/amd64</code> and <code>linux/arm64</code>. Every published image carries
+    a build provenance attestation and an SBOM; version tags are immutable and
+    <code>latest</code> moves only on a reviewed release.
+  </p>
+
+  <h2 id="requirements">Requirements</h2>
+  <ul>
+    <li>cert-manager v1.8.0 or later, installed in the cluster</li>
+    <li>A registered freemyip.com domain, for example <code>example.freemyip.com</code></li>
+    <li>The freemyip API token for that domain</li>
+  </ul>
+
+  <h2 id="faq">Common questions</h2>
+
+  <h3>Can it issue wildcard certificates?</h3>
+  <p>
+    Yes. DNS-01 is the only challenge type Let's Encrypt accepts for a wildcard name, and this
+    solver performs DNS-01, so a Certificate listing both <code>example.freemyip.com</code> and
+    <code>*.example.freemyip.com</code> is issued normally.
+  </p>
+
+  <h3>Why does issuance fail when freemyip answered <code>OK</code>?</h3>
+  <p>
+    freemyip applies an update to whichever domain the <strong>token</strong> owns, publishing at
+    <code>_acme-challenge</code> under that domain whatever the <code>domain</code> parameter says.
+    A token for the wrong domain therefore fails silently: the API answers <code>OK</code>, the
+    solver reports success, and validation never finds the record. Each freemyip domain has its
+    own token — check that the token matches the domain being issued for.
+  </p>
+
+  <h3>Is the chart the only way to run it?</h3>
+  <p>
+    In practice, yes. The image is not run directly: cert-manager reaches the solver through an
+    <code>APIService</code>, and the chart is what registers it along with the RBAC the webhook
+    needs to read its Secret.
+  </p>
+
+  <h2 id="more">Source, releases and issues</h2>
+  <ul class="links">
+    <li><a href="https://github.com/emulatorchen/cert-manager-webhook-freemyip">Source repository on GitHub</a></li>
+    <li><a href="https://github.com/emulatorchen/cert-manager-webhook-freemyip/releases">Releases and changelog</a></li>
+    <li><a href="https://github.com/emulatorchen/cert-manager-webhook-freemyip/issues">Report an issue</a></li>
+    <li><a href="index.yaml">Chart repository index (<code>index.yaml</code>)</a></li>
+  </ul>
+
+  <footer>
+    Apache 2.0 licensed. Not affiliated with freemyip.com, cert-manager or Let's Encrypt.
+  </footer>
+
+</main>
+</body>
+</html>
