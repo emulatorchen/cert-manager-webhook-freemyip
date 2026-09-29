@@ -74,23 +74,140 @@ for f in "$WF"/*.y*ml; do
                  || { bad "$(basename "$f"): PR-triggered and carries publish capability"; printf '%s\n' "$hits" | sed 's/^/        /'; }
 done
 
-# ── 5. publishing jobs declare environment: release ──────────────────────────
-head_ "Rule 4/5 — publishing jobs gated by the release environment"
+# ── 4b. every job states its own permissions ─────────────────────────────────
+#
+# A job with no `permissions:` block inherits the workflow default. That is fine
+# until someone widens the default for one job's benefit and silently widens
+# every other job with it — the token escalation nobody reviews, because the
+# diff touches one line far away from the job it affects. Stating them per job
+# makes the blast radius of any such change exactly one job.
+#
+# Jobs that call a reusable workflow are exempt: GitHub does not allow a
+# `permissions:` block alongside a job-level `uses:`.
+head_ "Permissions are declared per job, never inherited"
 for f in "$WF"/*.y*ml; do
   awk -v F="$(basename "$f")" '
     /^jobs:/ {injobs=1; next}
+    injobs && /^  #/ { next }
     injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
       if (job != "") flush()
-      job=$1; sub(/:$/,"",job); body=""; next
+      job=$1; sub(/:$/,"",job); perms=0; reusable=0; next
     }
-    injobs {body = body $0 "\n"}
-    END {if (job != "") flush()}
+    injobs && /^    permissions:/ { perms=1 }
+    injobs && /^    uses:/ { reusable=1 }
     function flush() {
-      pub = (body ~ /push:[[:space:]]*true/) || (body ~ /helm push/) \
-            || (body ~ /gh release create/) || (body ~ /packages:[[:space:]]*write/)
-      if (pub) {
-        if (body ~ /environment:[[:space:]]*release/) printf "  ok    %s:%s gated\n", F, job
-        else                                          printf "  FAIL  %s:%s publishes without environment: release\n", F, job
+      if (reusable) printf "  ok    %s:%s calls a reusable workflow\n", F, job
+      else if (perms) printf "  ok    %s:%s\n", F, job
+      else printf "  FAIL  %s:%s inherits the workflow default\n", F, job
+    }
+    END { if (job != "") flush() }
+  ' "$f"
+done > /tmp/_perm.txt
+cat /tmp/_perm.txt; grep -q FAIL /tmp/_perm.txt && FAIL=1; rm -f /tmp/_perm.txt
+
+# ── 4c. the published page is inert ──────────────────────────────────────────
+#
+# docs/pages/ is copied verbatim onto gh-pages by the release, so whatever is
+# there is served from the project's own origin. A third-party script, an
+# iframe, or a form on that page would be a credential-phishing surface wearing
+# this project's URL — and it would arrive through an ordinary-looking docs
+# commit rather than anything the release would question.
+#
+# Inline <script type="application/ld+json"> is structured metadata, carries no
+# code, and is allowed. Everything else with a src, and every event handler, is
+# not.
+head_ "Published pages carry no executable or third-party content"
+if [ -d docs/pages ]; then
+  for f in docs/pages/*.html; do
+    [ -e "$f" ] || continue
+    bad=""
+    grep -qiE '<script[^>]+src=' "$f"                         && bad="${bad} external-script"
+    grep -qiE '<iframe|<object|<embed' "$f"                   && bad="${bad} embedded-frame"
+    grep -qiE '<form|formaction=' "$f"                        && bad="${bad} form"
+    grep -qiE ' on[a-z]+=' "$f"                               && bad="${bad} inline-event-handler"
+    grep -qiE 'javascript:|vbscript:' "$f"                    && bad="${bad} script-url"
+    # rel="stylesheet" specifically. A canonical or alternate <link> carries no
+    # code and is exactly what the page is supposed to have.
+    grep -qiE '<link[^>]+rel="stylesheet"' "$f" \
+      && grep -qiE '<link[^>]+rel="stylesheet"[^>]+href="https?://' "$f" \
+      && bad="${bad} external-stylesheet"
+    # An inline <script> is allowed only for ld+json. -F, not a regex: `\+` in a
+    # basic regular expression means "one or more d", not a literal plus, which
+    # made this flag the very page it was written to allow.
+    if grep -qiE '<script' "$f" && grep -iE '<script' "$f" | grep -qvF 'application/ld+json'; then
+      bad="${bad} inline-script"
+    fi
+    [ -z "$bad" ] && ok "$(basename "$f"): inert" || bad "$(basename "$f"):${bad}"
+  done
+else
+  ok "no published pages"
+fi
+
+# ── 5. publishing jobs sit behind the approval environment ───────────────────
+#
+# `environment:` alone is NOT the check. The approval and the publish
+# credentials live in different environments on purpose — the reviewer sits on
+# release-approval, the Docker Hub token sits on release, which carries no
+# reviewer so that seven publishing jobs do not mean seven prompts. Treating
+# any environment as "gated" would therefore pass a job that publishes with
+# nobody approving anything. What has to hold is that every publishing job is,
+# or descends from, a job in APPROVAL_ENV.
+head_ "Rule 4/5 — publishing jobs sit behind the approval environment"
+APPROVAL_ENV="${APPROVAL_ENV:-release-approval}"
+for f in "$WF"/*.y*ml; do
+  awk -v F="$(basename "$f")" -v APPROVAL="$APPROVAL_ENV" '
+    # A comment block at job indentation introduces the job BELOW it, not the
+    # one above. Buffering those and handing them to the next job is what stops
+    # a comment mentioning another job being read as part of this one — which
+    # made one job look gated and another look like it published.
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  #/ { pend = pend $0 "\n"; next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (job != "") flush()
+      job=$1; sub(/:$/,"",job); body=pend; pend=""; next
+    }
+    injobs { if (pend != "") { body = body pend; pend = "" } body = body $0 "\n" }
+
+    function flush() { bodies[job] = body; order[++n] = job }
+    END {
+      if (job != "") flush()
+      # Only the approval environment counts as an approver.
+      for (j in bodies)
+        if (bodies[j] ~ ("environment:[[:space:]]*" APPROVAL "[[:space:]]*$") ||
+            bodies[j] ~ ("environment:[[:space:]]*" APPROVAL "[^A-Za-z0-9_-]")) approver[j] = 1
+
+      # Reachability, not just direct needs. A publishing job four hops below
+      # the approval is still governed by it, and checking one hop would have
+      # forced every job to declare the environment — the seven-prompt problem
+      # this split exists to solve.
+      for (j in bodies) {
+        b = bodies[j]
+        if (match(b, /needs:[^\n]*/)) needs[j] = substr(b, RSTART, RLENGTH)
+        else needs[j] = ""
+      }
+      for (pass = 1; pass <= n; pass++) {
+        changed = 0
+        for (j in bodies) {
+          if (j in covered || j in approver) continue
+          for (k in bodies) {
+            if (!(k in approver) && !(k in covered)) continue
+            if (index(needs[j], k)) { covered[j] = 1; changed = 1; break }
+          }
+        }
+        if (!changed) break
+      }
+
+      for (i = 1; i <= n; i++) {
+        j = order[i]; b = bodies[j]
+        pub = (b ~ /push:[[:space:]]*true/) || (b ~ /helm push/) \
+              || (b ~ /gh release create/) || (b ~ /imagetools create/)
+        if (!pub) continue
+        # A job may opt out with a marker naming its reason. Only for work that
+        # publishes nothing anyone would pull.
+        if (b ~ /no-release-gate:/) { printf "  ok    %s:%s exempt, see marker\n", F, j; continue }
+        if (j in approver) { printf "  ok    %s:%s is the approval job\n", F, j; continue }
+        if (j in covered)  { printf "  ok    %s:%s behind %s\n", F, j, APPROVAL; continue }
+        printf "  FAIL  %s:%s publishes without %s upstream\n", F, j, APPROVAL
       }
     }
   ' "$f"
@@ -127,8 +244,11 @@ rm -f /tmp/_ti.txt
 
 # ── 7. every checkout sets persist-credentials: false ────────────────────────
 head_ "artipacked — checkout must not persist credentials"
-n_co=$(grep -rho 'uses:[[:space:]]*actions/checkout@' "$WF" 2>/dev/null | wc -l | tr -d ' ')
-n_pc=$(grep -rho 'persist-credentials:[[:space:]]*false' "$WF" 2>/dev/null | wc -l | tr -d ' ')
+# Anchored to the start of the line so a *comment* mentioning either string
+# is not counted as one. An off-by-one here reads as a checkout missing the
+# setting, which is the one finding in this file that must never be noise.
+n_co=$(grep -rhE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*actions/checkout@' "$WF" 2>/dev/null | wc -l | tr -d ' ')
+n_pc=$(grep -rhE '^[[:space:]]*persist-credentials:[[:space:]]*false' "$WF" 2>/dev/null | wc -l | tr -d ' ')
 [ "$n_co" = "$n_pc" ] && ok "$n_pc/$n_co checkouts set persist-credentials: false" \
                       || bad "$n_pc/$n_co checkouts set persist-credentials: false"
 
@@ -201,8 +321,9 @@ for f in "$WF"/*.y*ml; do
   grep -qE 'secrets\.DOCKERHUB' "$f" || continue
   awk -v F="$(basename "$f")" '
     /^jobs:/ {injobs=1; next}
-    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=""; next }
-    injobs {body = body $0 "\n"}
+    injobs && /^  #/ { pend = pend $0 "\n"; next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=pend; pend=""; next }
+    injobs { if (pend != "") { body = body pend; pend = "" } body = body $0 "\n" }
     END {if (job!="") flush()}
     function flush() {
       if (body !~ /secrets\.DOCKERHUB/) return
@@ -250,8 +371,9 @@ for f in "$WF"/*.y*ml; do
   grep -qE 'secrets\.[A-Z_]+' "$f" || continue
   awk -v F="$(basename "$f")" '
     /^jobs:/ {injobs=1; next}
-    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=""; next }
-    injobs {body = body $0 "\n"}
+    injobs && /^  #/ { pend = pend $0 "\n"; next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { if (job!="") flush(); job=$1; sub(/:$/,"",job); body=pend; pend=""; next }
+    injobs { if (pend != "") { body = body pend; pend = "" } body = body $0 "\n" }
     END {if (job!="") flush()}
     function flush(  tmp) {
       tmp = body
