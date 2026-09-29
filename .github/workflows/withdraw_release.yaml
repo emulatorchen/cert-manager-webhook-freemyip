@@ -44,13 +44,13 @@
 #   withdraw_issues        GITHUB_TOKEN          issues: write
 #   withdraw_latest        Docker Hub token      packages: write (ghcr latest)
 #   withdraw_records       GITHUB_TOKEN          contents: write
-#   withdraw_packages      GHCR_DELETE_TOKEN     own environment, no write permission
+#   withdraw_packages      GITHUB_TOKEN          packages: write (this repository's packages only)
 #   withdraw_image         Docker Hub token      contents: read
 #   withdraw_attestations  GITHUB_TOKEN          attestations: write
 #
-# GHCR_DELETE_TOKEN is a classic PAT with delete:packages, which cannot be scoped
-# to one repository — it can delete any package on the account — so it is
-# readable by one job that holds nothing else.
+# No personal token is involved. ghcr versions are deleted with the run's own
+# GITHUB_TOKEN, which the admin role GitHub gives the publishing repository
+# allows — scoped to this repository's packages and to one run.
 name: Withdraw a release
 
 on:
@@ -697,17 +697,25 @@ jobs:
   # version, and the provenance referrer — by the same script the release's
   # failure cleanup uses.
   #
-  # Its own environment: the token is a classic PAT with delete:packages, which
-  # cannot be scoped to one repository, so the job holding it holds nothing else.
+  # With the workflow's own token, not a personal one. GitHub gives the
+  # repository whose workflow published a package the admin role on it, and with
+  # admin a run's GITHUB_TOKEN can delete that package's versions. So this job
+  # can reach exactly this repository's two packages, for the length of one run
+  # — where a personal delete:packages token would reach every package on the
+  # account, for months. The ability is not new: it came with publishing them.
+  #
+  # It is still behind the approval — `confirm` is upstream, and validate.sh
+  # fails any job that asks for packages: write without release-approval above
+  # it, so no workflow can use this ability unapproved.
   withdraw_packages:
     name: "4. Remove the ghcr packages"
     needs: [plan, confirm, withdraw_records]
     if: always() && needs.confirm.result == 'success' && needs.withdraw_records.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: ghcr-delete
     permissions:
       contents: read
+      packages: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -719,23 +727,23 @@ jobs:
 
       - name: Delete the chart, then the image, on ghcr
         env:
-          GH_TOKEN: ${{ secrets.GHCR_DELETE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           ACTOR: ${{ github.actor }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -uo pipefail
-          # Required. Skipping would let step 5 delete the Docker Hub copy while
-          # ghcr kept serving the same version.
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::GHCR_DELETE_TOKEN is not set in the ghcr-delete environment. Neither registry was touched, so they still match. Add the token and re-run."
-            exit 1
-          fi
           # The script reads each index to find its children, which needs pull
           # access to a package that may be private.
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
-          ./scripts/ghcr_delete_version.sh "${OWNER,,}" "charts%2Fcert-manager-webhook-freemyip" "$VERSION"
-          ./scripts/ghcr_delete_version.sh "${OWNER,,}" "cert-manager-webhook-freemyip" "$VERSION"
+          # A refusal here means the repository has lost its admin role on the
+          # package (Package settings → Manage Actions access). It fails before
+          # step 5, so Docker Hub is untouched and the registries still match.
+          if ! ./scripts/ghcr_delete_version.sh "${OWNER,,}" "charts%2Fcert-manager-webhook-freemyip" "$VERSION" \
+             || ! ./scripts/ghcr_delete_version.sh "${OWNER,,}" "cert-manager-webhook-freemyip" "$VERSION"; then
+            echo "::error::ghcr deletion failed. Check that ${GITHUB_REPOSITORY} has the Admin role under each package's Manage Actions access. Docker Hub was not touched."
+            exit 1
+          fi
 
   # ── 5. the Docker Hub version tag ──────────────────────────────────────────
   # A version tag matched by a tag-immutability rule can be neither overwritten

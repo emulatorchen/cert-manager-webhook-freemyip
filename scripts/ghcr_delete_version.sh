@@ -14,7 +14,9 @@
 #
 # Usage: ghcr_delete_version.sh <owner> <package> <version>
 #   <package> is URL-encoded as the API wants it, e.g. charts%2Fname
-# Env:    GH_TOKEN — classic PAT with read:packages and delete:packages
+# Env:    GH_TOKEN — a token with admin on the package: in Actions, the run's
+#         GITHUB_TOKEN with packages: write, for packages this repository's
+#         workflow published (GitHub grants that repository the admin role)
 #
 # Exits non-zero on any failure it cannot prove harmless, so the caller can stop
 # before touching another registry and leave the two still matching.
@@ -24,7 +26,7 @@ set -uo pipefail
 OWNER="${1:?usage: ghcr_delete_version.sh <owner> <package> <version>}"
 PKG="${2:?}"
 VERSION="${3:?}"
-: "${GH_TOKEN:?GH_TOKEN (read:packages, delete:packages) is required}"
+: "${GH_TOKEN:?GH_TOKEN with admin on the package is required}"
 
 for v in "$OWNER" "$VERSION"; do
   printf '%s' "$v" | grep -qE '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$' \
