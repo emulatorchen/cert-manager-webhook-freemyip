@@ -140,6 +140,13 @@ spec:
 | `image.tag` | `""` | Image tag; empty uses the chart `appVersion` |
 | `groupName` | `acme.freemyip.emulatorchen.github.com` | Webhook group name (must be unique) |
 
+## Vulnerability scan
+
+<!-- scan:begin -->
+_Populated by the release workflow. Until the first release publishes one, there
+is no scan to show here._
+<!-- scan:end -->
+
 ## Common questions
 
 **Can it issue wildcard certificates?**
