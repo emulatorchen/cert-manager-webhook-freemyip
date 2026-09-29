@@ -410,7 +410,7 @@ grep -q FAIL /tmp/_sec.txt && FAIL=1; rm -f /tmp/_sec.txt
 # on its own when the page source changes on main, by the user's decision to
 # keep one approval per release.
 head_ "Credential environments are reachable only through the approval"
-CRED_ENVS="${CRED_ENVS:-release ghcr-delete}"
+CRED_ENVS="${CRED_ENVS:-release}"
 for f in "$WF"/*.y*ml; do
   awk -v F="$(basename "$f")" -v APPROVAL="${APPROVAL_ENV:-release-approval}" -v CRED="$CRED_ENVS" '
     BEGIN { n = split(CRED, c, " "); for (i = 1; i <= n; i++) cred[c[i]] = 1 }
@@ -441,6 +441,49 @@ for f in "$WF"/*.y*ml; do
 done > /tmp/_cred.txt
 [ -s /tmp/_cred.txt ] && cat /tmp/_cred.txt || echo "  ok    no job uses a credential environment"
 grep -q FAIL /tmp/_cred.txt && FAIL=1; rm -f /tmp/_cred.txt
+
+# ── 12c. package write access is reachable only through the approval ─────────
+#
+# A run's GITHUB_TOKEN with packages: write can publish to this repository's
+# packages — and, because GitHub gives the publishing repository the admin role
+# on them, delete their versions. That is how the release publishes and how
+# rollback and withdraw remove versions without any personal token. It is not
+# an environment secret, so the rule above cannot see it: this one holds every
+# job asking for packages: write to the same standard — the approval job, or
+# downstream of it through `needs`.
+head_ "Package write access is reachable only through the approval"
+for f in "$WF"/*.y*ml; do
+  awk -v F="$(basename "$f")" -v APPROVAL="${APPROVAL_ENV:-release-approval}" '
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  #/ { next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job=$1; sub(/:$/,"",job); order[++m]=job; inperm=0; next }
+    injobs && job != "" && /^    needs:/ { needs[job] = $0 }
+    injobs && job != "" && /^    environment:/ { if ($2 == APPROVAL) approver[job]=1 }
+    injobs && job != "" && /^    permissions:/ { inperm=1; next }
+    injobs && job != "" && inperm && /^    [a-z]/ { inperm=0 }
+    injobs && job != "" && inperm && /^      packages:[[:space:]]*write/ { pw[job]=1 }
+    END {
+      for (pass = 1; pass <= m; pass++) {
+        changed = 0
+        for (i = 1; i <= m; i++) {
+          j = order[i]
+          if (j in covered || j in approver) continue
+          for (k in approver) if (index(needs[j], k)) { covered[j]=1; changed=1 }
+          for (k in covered)  if (!(j in covered) && index(needs[j], k)) { covered[j]=1; changed=1 }
+        }
+        if (!changed) break
+      }
+      for (i = 1; i <= m; i++) {
+        j = order[i]
+        if (!(j in pw)) continue
+        if (j in covered || j in approver) printf "  ok    %s:%s packages: write behind %s\n", F, j, APPROVAL
+        else printf "  FAIL  %s:%s asks for packages: write without passing %s\n", F, j, APPROVAL
+      }
+    }
+  ' "$f"
+done > /tmp/_pkg.txt
+[ -s /tmp/_pkg.txt ] && cat /tmp/_pkg.txt || echo "  ok    no job asks for packages: write"
+grep -q FAIL /tmp/_pkg.txt && FAIL=1; rm -f /tmp/_pkg.txt
 
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable

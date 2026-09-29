@@ -28,7 +28,6 @@ paths:
   .github/workflows/withdraw_release.yaml:
     ignore:
       - 'property "dockerhub_release_token" is not defined'
-      - 'property "ghcr_delete_token" is not defined'
   .github/workflows/update_dockerhub_description.yaml:
     ignore:
       - 'property "dockerhub_password" is not defined'
