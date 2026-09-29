@@ -1,0 +1,509 @@
+# Take a published release back.
+#
+# The release workflow cleans up only the narrow case it can recognise: a run
+# that started pushing and then failed. Everything else — a release that
+# finished and then turned out to be wrong, an image withdrawn days later, a
+# chart entry that should never have been advertised — has no path back except
+# doing it by hand across five places and forgetting one.
+#
+# ORDER MATTERS, and it is the exact reverse of publication:
+#
+#   publish    image:version → OCI chart → index → releases+tags → latest
+#   withdraw   latest → releases+tags → index → OCI chart → image:version
+#
+# Deleting in publication order would, for the length of the run, leave the
+# index advertising a chart whose image had already been deleted — the broken
+# state the release ordering exists to prevent. In reverse, every artefact still
+# advertised at any instant is still resolvable.
+#
+# CREDENTIALS. The deletion is split across four jobs rather than done in one,
+# because the tokens involved are not equally dangerous and must not share a job:
+#
+#   withdraw_latest    Docker Hub token      contents: read
+#   withdraw_records   GITHUB_TOKEN          contents: write
+#   withdraw_packages  GHCR_DELETE_TOKEN     contents: read
+#   withdraw_image     Docker Hub token      contents: read
+#
+# GHCR_DELETE_TOKEN is a classic PAT with delete:packages, and that scope cannot
+# be limited to one repository — it can delete any package on the account. It
+# therefore lives in its own environment, readable by exactly one job, which
+# holds no write permission and no other credential. The same reasoning that
+# keeps the Docker Hub account password out of the release workflow keeps this
+# token out of everything but the step that needs it.
+name: Withdraw a release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to withdraw, without the leading v (e.g. 0.1.0)"
+        required: true
+        type: string
+      confirm:
+        description: "Type the same version again to confirm. This deletes published artefacts."
+        required: true
+        type: string
+      delete_latest:
+        description: "Delete the latest tag first. Leave off only if latest already points somewhere else."
+        type: boolean
+        default: true
+      github_release:
+        description: "Delete the GitHub releases and their git tags"
+        type: boolean
+        default: true
+      chart_index:
+        description: "Remove the version from the Helm repository index on gh-pages"
+        type: boolean
+        default: true
+      ghcr_tags:
+        description: "Delete the ghcr chart package and image versions"
+        type: boolean
+        default: true
+      dockerhub_tag:
+        description: "Delete the Docker Hub version tag"
+        type: boolean
+        default: true
+
+# Its own group, not the release group: a withdrawal must not queue behind a
+# release, and a release must not be cancelled by a withdrawal.
+concurrency:
+  group: withdraw
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Ungated, and it runs first. The reviewer facing the approval is told exactly
+  # which artefacts exist and which will be deleted, rather than being asked to
+  # approve a version number.
+  plan:
+    name: "What will be deleted"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.p.outputs.version }}
+      hub_repo: ${{ steps.p.outputs.hub_repo }}
+      found: ${{ steps.p.outputs.found }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve and confirm
+        id: p
+        env:
+          VERSION: ${{ inputs.version }}
+          CONFIRM: ${{ inputs.confirm }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          DO_HUB: ${{ inputs.dockerhub_tag }}
+          DO_GHCR: ${{ inputs.ghcr_tags }}
+          DO_REL: ${{ inputs.github_release }}
+          DO_IDX: ${{ inputs.chart_index }}
+          DO_LATEST: ${{ inputs.delete_latest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          version=$(printf '%s' "$VERSION" | tr -d '[:space:]')
+          confirm=$(printf '%s' "$CONFIRM" | tr -d '[:space:]')
+          version="${version#v}"
+          confirm="${confirm#v}"
+          # Typing it twice is the only protection against withdrawing the wrong
+          # version: a Docker Hub tag rule makes version tags immutable, so the
+          # number cannot simply be republished afterwards.
+          if [ "$version" != "$confirm" ]; then
+            echo "::error::confirmation does not match: got '${confirm}', expected '${version}'"
+            exit 1
+          fi
+          [ -n "$version" ] || { echo "::error::no version given"; exit 1; }
+          # Constrained before it reaches a URL or a shell word anywhere below.
+          printf '%s' "$version" | grep -qE '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$' \
+            || { echo "::error::'${version}' is not a plain version string"; exit 1; }
+          if [ -z "${HUB_REPO:-}" ]; then
+            echo "::error::repository variable DOCKERHUB_REPOSITORY is not set"
+            exit 1
+          fi
+
+          found=0
+          {
+            echo "## Withdrawing \`${version}\`"
+            echo ""
+            echo "Deleted in this order — the reverse of how they were published,"
+            echo "so nothing is ever advertised after the thing it points at is gone."
+            echo ""
+            echo "| # | Artefact | State | Action |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          row() { printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # 1 — latest, the only pointer anyone follows.
+          if [ "$DO_LATEST" = "true" ]; then
+            row 1 "Docker Hub \`latest\`" "selected" "**delete** — leaves no latest tag"
+            found=1
+          else
+            row 1 "Docker Hub \`latest\`" "kept" "may still serve this version"
+          fi
+
+          # 2 — the release list.
+          for name in "v${version}" "cert-manager-webhook-freemyip-${version}"; do
+            if gh release view "$name" --repo "$REPO" >/dev/null 2>&1; then
+              if [ "$DO_REL" = "true" ]; then
+                row 2 "release \`${name}\`" "published" "**delete**, with its git tag"; found=1
+              else
+                row 2 "release \`${name}\`" "published" "keep (not selected)"
+              fi
+            else
+              row 2 "release \`${name}\`" "absent" "nothing to do"
+            fi
+          done
+
+          # 3 — the chart repository index.
+          if idx=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null); then
+            if printf '%s' "$idx" | base64 -d | grep -q "version: ${version}\$"; then
+              if [ "$DO_IDX" = "true" ]; then
+                row 3 "Helm index entry" "advertised" "**remove**, and delete the .tgz"; found=1
+              else
+                row 3 "Helm index entry" "advertised" "keep (not selected)"
+              fi
+            else
+              row 3 "Helm index entry" "not advertised" "nothing to do"
+            fi
+          else
+            row 3 "Helm index entry" "no gh-pages index" "nothing to do"
+          fi
+
+          # 4 — the packages, charts before the image so the chart is
+          #     unreachable before its image disappears.
+          for pkg in "charts%2Fcert-manager-webhook-freemyip" "cert-manager-webhook-freemyip"; do
+            n=$(gh api "users/${OWNER}/packages/container/${pkg}/versions" \
+                  --jq "[.[] | select(.metadata.container.tags | index(\"${version}\"))] | length" 2>/dev/null || echo "?")
+            name=$(printf '%s' "$pkg" | sed 's/%2F/\//')
+            if [ "$n" = "?" ]; then
+              row 4 "ghcr \`${name}\`" "could not read" "skipped"
+            elif [ "$n" = "0" ]; then
+              row 4 "ghcr \`${name}\`" "absent" "nothing to do"
+            elif [ "$DO_GHCR" = "true" ]; then
+              row 4 "ghcr \`${name}\`" "published" "**delete** ${n} version(s)"; found=1
+            else
+              row 4 "ghcr \`${name}\`" "published" "keep (not selected)"
+            fi
+          done
+
+          # 5 — the immutable one, last.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/")
+          if [ "$code" = "200" ]; then
+            if [ "$DO_HUB" = "true" ]; then
+              row 5 "Docker Hub \`${version}\`" "published" "**delete**"; found=1
+            else
+              row 5 "Docker Hub \`${version}\`" "published" "keep (not selected)"
+            fi
+          else
+            row 5 "Docker Hub \`${version}\`" "absent (HTTP ${code})" "nothing to do"
+          fi
+
+          {
+            echo ""
+            if [ "$found" = "1" ]; then
+              echo "**The next approval DELETEs the artefacts marked above. It publishes nothing.**"
+              echo ""
+              echo "Review deployments → release-approval → Approve and deploy, to proceed."
+            else
+              echo "Nothing selected exists. There is nothing to withdraw."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "version=${version}"
+            echo "hub_repo=${HUB_REPO}"
+            echo "found=${found}"
+          } >> "$GITHUB_OUTPUT"
+
+  # The approval, in the environment that carries the reviewer. It holds no
+  # secrets and deletes nothing — the same split as the release, for the same
+  # reason: the job that asks is not the job that acts.
+  confirm:
+    name: "⚠️ Approve to DELETE the artefacts listed above"
+    needs: [plan]
+    # Skipped rather than approved when the plan found nothing, so an approval
+    # is never requested for a no-op.
+    if: needs.plan.outputs.found == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Record the decision
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: echo "withdrawal of ${VERSION} approved"
+
+  # ── 1. latest ──────────────────────────────────────────────────────────────
+  # First, because it is the only thing a user reaches without knowing a version
+  # number. Everything below is still resolvable while this runs.
+  withdraw_latest:
+    name: "1. Remove latest"
+    needs: [plan, confirm]
+    if: always() && needs.confirm.result == 'success' && inputs.delete_latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Delete the Docker Hub latest tag
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+        run: |
+          set -uo pipefail
+          # Trimmed for the same reason as every other Hub call here: a newline
+          # inside the JSON string makes the body invalid and the API just
+          # refuses, with nothing that says why. Case is left exactly as stored.
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${user}\",\"password\":\"${pat}\"}" \
+            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
+          if [ -z "$jwt" ]; then
+            echo "::error::could not authenticate to the Docker Hub API — delete the tag by hand"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/latest/" \
+            -H "Authorization: Bearer ${jwt}")
+          echo "delete ${HUB_REPO}:latest -> ${code}"
+          case "$code" in
+            20*|404) ;;
+            *) echo "::warning::unexpected status ${code} deleting latest" ;;
+          esac
+
+  # ── 2 and 3. the records: releases, tags, and the chart index ──────────────
+  # The only job here that can write to the repository, and it holds no registry
+  # credential of any kind.
+  withdraw_records:
+    name: "2. Remove the releases, tags and chart index"
+    needs: [plan, confirm, withdraw_latest]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_latest.result != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Delete the GitHub releases and their tags
+        if: inputs.github_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -uo pipefail
+          # Both names: ours, and the one chart-releaser makes for itself.
+          # Neither is guaranteed to exist, so absence is not an error.
+          for name in "v${VERSION}" "cert-manager-webhook-freemyip-${VERSION}"; do
+            if gh release delete "$name" --repo "$REPO" --cleanup-tag --yes 2>/dev/null; then
+              echo "deleted release ${name} and its tag"
+            else
+              echo "release ${name} not present"
+            fi
+          done
+
+      # Edited through the contents API rather than a push, because every
+      # checkout in this repository runs persist-credentials: false and a
+      # destructive job is the last place to start holding a pushable credential
+      # in a shell.
+      - name: Remove the version from the Helm repository index
+        if: inputs.chart_index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -uo pipefail
+          command -v yq >/dev/null 2>&1 || { echo "::error::yq is not available on this runner"; exit 1; }
+          meta=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" 2>/dev/null) || {
+            echo "no index.yaml on gh-pages — nothing to remove"; exit 0; }
+          sha=$(printf '%s' "$meta" | jq -r '.sha')
+          printf '%s' "$meta" | jq -r '.content' | base64 -d > index.yaml
+
+          before=$(yq '.entries["cert-manager-webhook-freemyip"] | length' index.yaml)
+          V="$VERSION" yq -i \
+            'del(.entries["cert-manager-webhook-freemyip"][] | select(.version == strenv(V)))' index.yaml
+          after=$(yq '.entries["cert-manager-webhook-freemyip"] | length' index.yaml)
+          if [ "$before" = "$after" ]; then
+            echo "index.yaml does not advertise ${VERSION} — left unchanged"
+            exit 0
+          fi
+          echo "removed ${VERSION} from index.yaml (${before} -> ${after} entries)"
+
+          gh api -X PUT "repos/${REPO}/contents/index.yaml" \
+            -f message="Withdraw ${VERSION} from the chart repository index" \
+            -f content="$(base64 < index.yaml | tr -d '\n')" \
+            -f sha="$sha" -f branch=gh-pages >/dev/null
+          echo "index.yaml updated on gh-pages"
+
+          tgz="cert-manager-webhook-freemyip-${VERSION}.tgz"
+          if tsha=$(gh api "repos/${REPO}/contents/${tgz}?ref=gh-pages" --jq '.sha' 2>/dev/null); then
+            gh api -X DELETE "repos/${REPO}/contents/${tgz}" \
+              -f message="Withdraw ${tgz}" -f sha="$tsha" -f branch=gh-pages >/dev/null
+            echo "deleted ${tgz} from gh-pages"
+          fi
+
+          # Read back, for the same reason the release reads the index back
+          # after publishing: the step's success has to mean what its name says.
+          if gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' \
+             | base64 -d | grep -q "version: ${VERSION}\$"; then
+            echo "::error::index.yaml still advertises ${VERSION} after the update"
+            exit 1
+          fi
+
+  # ── 4. the packages ────────────────────────────────────────────────────────
+  # Charts before the image: the chart is what points at the image, so it goes
+  # first and the image is never the dangling half of the pair.
+  #
+  # Its own environment, and nothing else in this repository declares it. The
+  # token here is a classic PAT with delete:packages, which GitHub cannot scope
+  # to a single repository — it can delete any package on the account. So the
+  # job holding it has no write permission, no Docker Hub credential, and does
+  # nothing but this.
+  withdraw_packages:
+    name: "3. Remove the ghcr packages"
+    needs: [plan, confirm, withdraw_records]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_records.result == 'success' && inputs.ghcr_tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ghcr-delete
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Delete the ghcr chart and image versions
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_DELETE_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -uo pipefail
+          # Optional by design: without the token this says what to delete by
+          # hand rather than failing the withdrawal, because the rest of the
+          # unwind matters more than this half of it.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::GHCR_DELETE_TOKEN is not set — the ghcr versions tagged ${VERSION} were left in place. Delete them from the package's Manage versions page, or add a classic token with delete:packages to the ghcr-delete environment."
+            exit 0
+          fi
+          for pkg in "charts%2Fcert-manager-webhook-freemyip" "cert-manager-webhook-freemyip"; do
+            ids=$(gh api "users/${OWNER}/packages/container/${pkg}/versions" \
+                    --jq ".[] | select(.metadata.container.tags | index(\"${VERSION}\")) | .id" 2>/dev/null) || continue
+            for id in $ids; do
+              if gh api -X DELETE "users/${OWNER}/packages/container/${pkg}/versions/${id}" >/dev/null 2>&1; then
+                echo "deleted ${pkg} version ${id}"
+              else
+                echo "::warning::could not delete ${pkg} version ${id} — the token needs delete:packages"
+              fi
+            done
+          done
+
+  # ── 5. the immutable one, last ─────────────────────────────────────────────
+  withdraw_image:
+    name: "4. Remove the Docker Hub version tag"
+    needs: [plan, confirm, withdraw_packages]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_packages.result != 'failure' && inputs.dockerhub_tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Delete the Docker Hub version tag
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -uo pipefail
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${user}\",\"password\":\"${pat}\"}" \
+            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
+          if [ -z "$jwt" ]; then
+            echo "::error::could not authenticate to the Docker Hub API — delete the tag by hand"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" \
+            -H "Authorization: Bearer ${jwt}")
+          echo "delete ${HUB_REPO}:${VERSION} -> ${code}"
+          case "$code" in
+            20*|404) ;;
+            *) echo "::warning::unexpected status ${code} deleting ${VERSION}" ;;
+          esac
+
+  report:
+    name: "What was withdrawn"
+    needs: [plan, withdraw_latest, withdraw_records, withdraw_packages, withdraw_image]
+    if: always() && needs.plan.outputs.found == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Summarise
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          DO_LATEST: ${{ inputs.delete_latest }}
+          R_LATEST: ${{ needs.withdraw_latest.result }}
+          R_RECORDS: ${{ needs.withdraw_records.result }}
+          R_PACKAGES: ${{ needs.withdraw_packages.result }}
+          R_IMAGE: ${{ needs.withdraw_image.result }}
+        run: |
+          {
+            echo "## Withdrawn: \`${VERSION}\`"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| 1. latest | ${R_LATEST} |"
+            echo "| 2. releases, tags, chart index | ${R_RECORDS} |"
+            echo "| 3. ghcr packages | ${R_PACKAGES} |"
+            echo "| 4. Docker Hub version tag | ${R_IMAGE} |"
+            echo ""
+            echo "Any artefact that could not be deleted is reported as a warning in"
+            echo "its step rather than silently skipped."
+            if [ "$DO_LATEST" != "true" ]; then
+              echo ""
+              echo "\`latest\` was not touched. If it pointed at \`${VERSION}\`, that image is"
+              echo "still pullable through it: release the version that should replace it,"
+              echo "or re-run this with **Delete the latest tag** enabled."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
