@@ -397,6 +397,51 @@ done > /tmp/_sec.txt
 [ -s /tmp/_sec.txt ] && cat /tmp/_sec.txt || echo "  ok    no privileged secrets outside GITHUB_TOKEN"
 grep -q FAIL /tmp/_sec.txt && FAIL=1; rm -f /tmp/_sec.txt
 
+# ── 12b. credential environments are reachable only through the approval ─────
+#
+# `release` and `ghcr-delete` carry no reviewer of their own — the reviewer sits
+# on release-approval, so one decision covers a whole release instead of one
+# prompt per job. That makes the environment check above necessary but not
+# sufficient: any job on main that declares `environment: release` receives the
+# Docker Hub publish token, approved or not. What has to hold is that every such
+# job is the approval job or descends from it through `needs`.
+#
+# dockerhub-metadata is deliberately not listed: its job refreshes the Hub page
+# on its own when the page source changes on main, by the user's decision to
+# keep one approval per release.
+head_ "Credential environments are reachable only through the approval"
+CRED_ENVS="${CRED_ENVS:-release ghcr-delete}"
+for f in "$WF"/*.y*ml; do
+  awk -v F="$(basename "$f")" -v APPROVAL="${APPROVAL_ENV:-release-approval}" -v CRED="$CRED_ENVS" '
+    BEGIN { n = split(CRED, c, " "); for (i = 1; i <= n; i++) cred[c[i]] = 1 }
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  #/ { next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job=$1; sub(/:$/,"",job); order[++m]=job; next }
+    injobs && job != "" && /^    needs:/ { needs[job] = $0 }
+    injobs && job != "" && /^    environment:/ { e=$2; env[job]=e; if (e == APPROVAL) approver[job]=1 }
+    END {
+      for (pass = 1; pass <= m; pass++) {
+        changed = 0
+        for (i = 1; i <= m; i++) {
+          j = order[i]
+          if (j in covered || j in approver) continue
+          for (k in approver) if (index(needs[j], k)) { covered[j]=1; changed=1 }
+          for (k in covered)  if (!(j in covered) && index(needs[j], k)) { covered[j]=1; changed=1 }
+        }
+        if (!changed) break
+      }
+      for (i = 1; i <= m; i++) {
+        j = order[i]
+        if (!(env[j] in cred)) continue
+        if (j in covered) printf "  ok    %s:%s (%s) behind %s\n", F, j, env[j], APPROVAL
+        else              printf "  FAIL  %s:%s reads the %s environment without passing %s\n", F, j, env[j], APPROVAL
+      }
+    }
+  ' "$f"
+done > /tmp/_cred.txt
+[ -s /tmp/_cred.txt ] && cat /tmp/_cred.txt || echo "  ok    no job uses a credential environment"
+grep -q FAIL /tmp/_cred.txt && FAIL=1; rm -f /tmp/_cred.txt
+
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable
 # from a correct pin by eye. Needs network and gh; skipped without them, and
