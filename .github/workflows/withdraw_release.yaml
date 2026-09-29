@@ -576,8 +576,10 @@ jobs:
               docker buildx imagetools create --tag "${img}:latest" "${img}:${PREV}" \
                 || { echo "::error::could not move ${img}:latest back to ${PREV}"; exit 1; }
               want=$(at "${img}:${PREV}")
-              [ -n "$want" ] && [ "$(at "${img}:latest")" = "$want" ] \
-                || { echo "::error::${img}:latest does not resolve to ${PREV} after moving it"; exit 1; }
+              if [ -z "$want" ] || [ "$(at "${img}:latest")" != "$want" ]; then
+                echo "::error::${img}:latest does not resolve to ${PREV} after moving it"
+                exit 1
+              fi
               echo "${img}:latest -> ${PREV} (${want})"
             elif [ "$img" = "$hub" ]; then
               user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')

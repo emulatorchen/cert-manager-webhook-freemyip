@@ -992,16 +992,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Skipped rather than failed until the branch exists, so a repository not
-      # yet set up for Pages still releases everything else.
+      # Fatal now. This used to skip with a warning so a repository not yet set
+      # up for Pages could still release. Pages is set up, and the chart
+      # repository is one of the install routes the Docker Hub tag is bound to —
+      # committing the tag without it would publish a release `helm repo add`
+      # users cannot see. `present` stays so the steps below read the same.
       - name: Check for the gh-pages branch
         id: pages
         run: |
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::no gh-pages branch — the chart is still on the OCI registry and attached to the release, but helm repo add will not work. Create the branch and enable Pages."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::error::no gh-pages branch — the chart repository cannot be published, so the release stops here and rolls back. Create the branch and enable Pages."
+            exit 1
           fi
 
       # chart-releaser commits the index, so git needs an identity. Attributed
@@ -1142,23 +1145,33 @@ jobs:
               echo "${name} unchanged"
               continue
             fi
+            # Fatal, not a warning. The pages are part of the release's metadata,
+            # and the Docker Hub version tag is only committed once all of that
+            # succeeded — a page that silently failed to publish would let an
+            # immutable tag be committed alongside a stale page.
             sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha' 2>/dev/null || true)
             if [ -n "$sha" ]; then
-              gh api -X PUT "repos/${REPO}/contents/${name}" \
-                -f message="Update ${name} for ${VERSION}" \
-                -f content="$local_b64" -f sha="$sha" -f branch=gh-pages >/dev/null \
-                && { echo "updated ${name}"; changed=1; } \
-                || echo "::warning::could not update ${name} on gh-pages"
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Update ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f sha="$sha" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not update ${name} on gh-pages"
+                exit 1
+              fi
+              echo "updated ${name}"
             else
-              gh api -X PUT "repos/${REPO}/contents/${name}" \
-                -f message="Add ${name} for ${VERSION}" \
-                -f content="$local_b64" -f branch=gh-pages >/dev/null \
-                && { echo "added ${name}"; changed=1; } \
-                || echo "::warning::could not add ${name} to gh-pages"
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Add ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not add ${name} to gh-pages"
+                exit 1
+              fi
+              echo "added ${name}"
             fi
+            changed=1
           done
-          [ "$changed" = "0" ] && echo "page sources already current"
-          exit 0
+          if [ "$changed" = "0" ]; then
+            echo "page sources already current"
+          fi
 
   github_release:
     name: "Create GitHub release"
@@ -1490,10 +1503,17 @@ jobs:
             exit 0
           fi
 
+          # Fatal, like every other write before the Docker Hub tag is committed:
+          # the issues are part of the CVE list this release publishes. A failed
+          # listing used to read as "no open issues" and open duplicates of all
+          # of them; a failed create or comment used to be ignored because the
+          # loop ran in a pipe's subshell with nothing checking it.
           open_issues=$(gh issue list --repo "$REPO" --label security --state open \
-            --json number,title --limit 100 2>/dev/null || echo "[]")
+            --json number,title --limit 100) \
+            || { echo "::error::cannot list the open security issues"; exit 1; }
 
-          echo "$cves" | while read -r cve; do
+          failed=0
+          while read -r cve; do
             [ -z "$cve" ] && continue
             row=$(jq -r --arg cve "$cve" '
               .Results[]?.Vulnerabilities[]? |
@@ -1513,15 +1533,18 @@ jobs:
 
             if [ -n "$existing" ]; then
               gh issue comment "$existing" --repo "$REPO" \
-                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`."
+                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`." \
+                || { echo "::error::could not comment on #${existing} for ${cve}"; failed=1; }
             else
               body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**Detected in release:** `%s`\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
                 "$cve" "$severity" "$pkg" "$fixed" "$TAG" "$cve")
               gh issue create --repo "$REPO" \
                 --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
-                --body "$body" --label "$labels"
+                --body "$body" --label "$labels" \
+                || { echo "::error::could not open an issue for ${cve}"; failed=1; }
             fi
-          done
+          done < <(printf '%s\n' "$cves")
+          exit "$failed"
 
 
   # Separated from the job above on purpose. `contents: write` is the permission
@@ -1544,11 +1567,12 @@ jobs:
         with:
           name: scan-pages
 
-      # Deliberately not fatal. The release is published and correct by this
-      # point, and failing here would mark a good release red over a
-      # documentation commit — the warning is the signal, not the exit code.
+      # Fatal. This used to run after a finished release, where a warning was
+      # the right signal. It now runs before the Docker Hub version tag is
+      # committed, and the scan is part of what that tag is bound to: if the
+      # README cannot show it, the tag must not be created, and the rollback
+      # takes back the rest.
       - name: Commit the scan onto the default branch
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1557,11 +1581,8 @@ jobs:
         run: |
           set -uo pipefail
           for f in README.md docs/dockerhub_description.md; do
-            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}" 2>/dev/null || true)
-            if [ -z "$meta" ]; then
-              echo "::warning::${f} not found on ${BRANCH} — skipped"
-              continue
-            fi
+            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}") \
+              || { echo "::error::cannot read ${f} on ${BRANCH}"; exit 1; }
             sha=$(printf '%s' "$meta" | jq -r '.sha')
             # Identical content would mean an empty commit, which the API
             # rejects — and a release that changed nothing on the page is a
@@ -1578,7 +1599,8 @@ jobs:
                  -f sha="$sha" -f branch="$BRANCH" >/dev/null; then
               echo "updated ${f} on ${BRANCH}"
             else
-              echo "::warning::could not update ${f} on ${BRANCH}"
+              echo "::error::could not update ${f} on ${BRANCH}"
+              exit 1
             fi
           done
 
