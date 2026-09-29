@@ -138,6 +138,7 @@ spec:
 | `clusterIssuer.staging.create` | `false` | Create the staging ClusterIssuer |
 | `image.repository` | `docker.io/emulator/cert-manager-webhook-freemyip` | Image registry path |
 | `image.tag` | `""` | Image tag; empty uses the chart `appVersion` |
+| `image.digest` | set per release | Exact published image; overrides `image.tag` when set. Clear it to choose by tag |
 | `groupName` | `acme.freemyip.emulatorchen.github.com` | Webhook group name (must be unique) |
 
 ## Vulnerability scan

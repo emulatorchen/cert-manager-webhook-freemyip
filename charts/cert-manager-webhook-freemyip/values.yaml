@@ -29,6 +29,11 @@ image:
   repository: docker.io/emulator/cert-manager-webhook-freemyip
   # Defaults to the chart appVersion when empty.
   tag: ""
+  # Set by the release to the exact image it published and attested; when set
+  # it wins over `tag`. Installing by digest means a chart always runs the
+  # image that was verified, whatever later happens to any tag. Clear it to
+  # select an image by `tag` instead.
+  digest: ""
   pullPolicy: IfNotPresent
 
 certManager:

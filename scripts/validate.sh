@@ -82,8 +82,10 @@ done
 # diff touches one line far away from the job it affects. Stating them per job
 # makes the blast radius of any such change exactly one job.
 #
-# Jobs that call a reusable workflow are exempt: GitHub does not allow a
-# `permissions:` block alongside a job-level `uses:`.
+# Jobs that call a reusable workflow are held to it too. GitHub supports
+# `permissions:` on them, and it matters more there: a called workflow can only
+# narrow the token its caller hands it, so the caller's block is the ceiling
+# for every job inside.
 head_ "Permissions are declared per job, never inherited"
 for f in "$WF"/*.y*ml; do
   awk -v F="$(basename "$f")" '
@@ -96,8 +98,7 @@ for f in "$WF"/*.y*ml; do
     injobs && /^    permissions:/ { perms=1 }
     injobs && /^    uses:/ { reusable=1 }
     function flush() {
-      if (reusable) printf "  ok    %s:%s calls a reusable workflow\n", F, job
-      else if (perms) printf "  ok    %s:%s\n", F, job
+      if (perms) printf "  ok    %s:%s%s\n", F, job, (reusable ? " (reusable-workflow caller)" : "")
       else printf "  FAIL  %s:%s inherits the workflow default\n", F, job
     }
     END { if (job != "") flush() }
@@ -274,23 +275,31 @@ for f in "$WF"/release.y*ml; do
   fi
 done
 
-# ── 10. cancellation cleanup for non-atomic registries ───────────────────────
-# Docker Hub publishes tag by tag, so a cancel mid-run leaves a half-released
-# version behind. Something has to clean that up.
+# ── 10. a cancelled or failed release is reverted ────────────────────────────
+# Something must run when a release stops part-way after its first push, and
+# undo it. That used to be a set of cleanup_* jobs; it is now a `rollback` job
+# calling the withdraw workflow, because the Docker Hub version tag — the only
+# write that cannot be undone — is created last and in one step, so everything
+# a stopped release can have written is reversible.
 #
-# The condition is matched loosely because a failure part-way through the push
-# strands tags exactly as a cancel does, so the guard is failure() ||
-# cancelled() — the docker-nginx-lego form — not cancelled() alone.
-head_ "Rule 6 — cancellation cleanup present"
+# Checked as a property: some cleanup_* or rollback job runs with always(), so
+# it still runs when the workflow is cancelled, and its condition takes a
+# cancelled push into account.
+head_ "Rule 6 — a cancelled or failed release is reverted"
 for f in "$WF"/release.y*ml; do
   [ -e "$f" ] || continue
-  # Matched across the file rather than on one line: the guard is a multi-line
-  # `if:` block, because it also has to distinguish a push that started from a
-  # rejected approval, which fails the workflow identically.
-  if grep -qE 'cancelled\(\)' "$f" && grep -qE '^  cleanup_[A-Za-z0-9_]+:' "$f"; then
-    ok "$(basename "$f"): has a cleanup job covering cancellation"
+  hit=$(awk '
+    /^  (rollback|cleanup_[A-Za-z0-9_]+):[[:space:]]*$/ { injob=1; body=""; next }
+    injob && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { injob=0 }
+    injob { body = body $0 "\n" }
+    injob && /^    (uses|steps):/ {
+      if (body ~ /always\(\)/ && body ~ /cancelled/) { print "yes"; exit }
+    }
+  ' "$f")
+  if [ "$hit" = "yes" ]; then
+    ok "$(basename "$f"): a rollback runs on cancellation and failure"
   else
-    bad "$(basename "$f"): no cleanup job covering cancellation"
+    bad "$(basename "$f"): nothing reverts a release cancelled or failed after its first push"
   fi
 done
 

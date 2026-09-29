@@ -33,22 +33,15 @@ on:
     # Declared explicitly rather than using `secrets: inherit`, so the caller
     # hands over this one value and nothing else.
     #
-    # DOCKERHUB_PASSWORD is declared but never passed. GitHub's documented rule
-    # is that when a called workflow's job declares an environment, the
-    # environment secret wins over anything the caller sends — so the value is
-    # meant to come from dockerhub-metadata and a caller cannot substitute one.
-    # actionlint models the secrets context as exactly this list and has no
-    # concept of environment secrets, so removing the declaration only trades a
-    # runtime question for a lint error.
-    #
-    # Release #6 read an empty value here and skipped silently. Which of the two
-    # values was empty was not recoverable from the log, because the check said
-    # "A or B". It now names the one that is missing and fails outright on a
-    # release, so the next run answers the question instead of hiding it.
+    # DOCKERHUB_PASSWORD is deliberately NOT declared. It is an environment
+    # secret of dockerhub-metadata, which the job below declares; release #6
+    # declared it here without passing it and the job read it as empty. It is
+    # left to the environment alone, and .github/actionlint.yaml says why
+    # actionlint is told to expect that. The same holds for the withdraw
+    # workflow's environment secrets, so this job's next run is also the proof
+    # that the release's rollback can reach its credentials.
     secrets:
       DOCKERHUB_USERNAME:
-        required: false
-      DOCKERHUB_PASSWORD:
         required: false
 
 # Serialise: two pushes in quick succession should not race to set the
