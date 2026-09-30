@@ -1,0 +1,5 @@
+# The whole site is one public page plus the chart repository index.
+User-agent: *
+Allow: /
+
+Sitemap: https://emulatorchen.github.io/cert-manager-webhook-freemyip/sitemap.xml
