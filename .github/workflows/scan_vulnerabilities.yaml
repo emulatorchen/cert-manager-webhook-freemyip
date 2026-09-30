@@ -7,7 +7,7 @@ name: scan-vulnerabilities
 # This scans a fresh build from the Dockerfile rather than the published image:
 # it answers "what would ship if we released today", which is what the auto-fix
 # job below can actually act on. The published image is scanned separately, by
-# post_release_report in the release workflow.
+# scan_published in the release workflow.
 #
 # Nothing here fails a build. The release workflow is the only place that blocks.
 

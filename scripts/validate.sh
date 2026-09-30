@@ -277,19 +277,19 @@ done
 
 # ── 10. a cancelled or failed release is reverted ────────────────────────────
 # Something must run when a release stops part-way after its first push, and
-# undo it. That used to be a set of cleanup_* jobs; it is now a `rollback` job
-# calling the withdraw workflow, because the Docker Hub version tag — the only
-# write that cannot be undone — is created last and in one step, so everything
-# a stopped release can have written is reversible.
+# undo it. That is the rollback_* jobs, in the same run, running the same
+# scripts/withdraw/ steps as the withdraw workflow. The Docker Hub version tag,
+# the only write that cannot be undone, is created last and in one step, so
+# everything a stopped release can have written is reversible.
 #
-# Checked as a property: some cleanup_* or rollback job runs with always(), so
+# Checked as a property: some cleanup_* or rollback* job runs with always(), so
 # it still runs when the workflow is cancelled, and its condition takes a
 # cancelled push into account.
 head_ "Rule 6 — a cancelled or failed release is reverted"
 for f in "$WF"/release.y*ml; do
   [ -e "$f" ] || continue
   hit=$(awk '
-    /^  (rollback|cleanup_[A-Za-z0-9_]+):[[:space:]]*$/ { injob=1; body=""; next }
+    /^  (rollback[A-Za-z0-9_]*|cleanup_[A-Za-z0-9_]+):[[:space:]]*$/ { injob=1; body=""; next }
     injob && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { injob=0 }
     injob { body = body $0 "\n" }
     injob && /^    (uses|steps):/ {
@@ -485,18 +485,15 @@ done > /tmp/_pkg.txt
 [ -s /tmp/_pkg.txt ] && cat /tmp/_pkg.txt || echo "  ok    no job asks for packages: write"
 grep -q FAIL /tmp/_pkg.txt && FAIL=1; rm -f /tmp/_pkg.txt
 
-# ── 12d. at most one job may start workflows, and only behind the approval ────
+# ── 12d. no job may start workflows, and nothing is a called workflow ────────
 # actions: write lets a job start any workflow in the repository. The release
-# needs it for exactly one thing — starting the withdrawal of a release that
-# failed before its commit — so exactly one job may hold it, and it must sit
-# behind release-approval like every other job that changes something.
+# used it once, to start the withdrawal of a failed release as a separate run;
+# the rollback now runs in the release's own run, so nothing needs it.
 # No workflow here is called by another: a called workflow's jobs never
 # received their environments' secrets.
-head_ "Only the rollback can start workflows; nothing is a called workflow"
-aw=$(grep -rlE '^[[:space:]]+actions:[[:space:]]*write' "$WF" 2>/dev/null | wc -l | tr -d ' ')
+head_ "No job can start workflows; nothing is a called workflow"
 awjobs=$(awk '/^jobs:/{j=1;next} j && /^  [A-Za-z0-9_-]+:[[:space:]]*$/{job=$1} j && /^      actions:[[:space:]]*write/{print FILENAME":"job}' "$WF"/*.y*ml)
-n_aw=$(printf '%s' "$awjobs" | grep -c . || true)
-if [ "$n_aw" -le 1 ]; then ok "jobs with actions: write: ${n_aw} ${awjobs}"; else bad "more than one job can start workflows: $(printf '%s' "$awjobs" | tr '\n' ' ')"; fi
+if [ -z "$awjobs" ]; then ok "no job has actions: write"; else bad "jobs that can start workflows: $(printf '%s' "$awjobs" | tr '\n' ' ')"; fi
 calls=$(grep -rnE '^[[:space:]]+uses:[[:space:]]*\./\.github/workflows/' "$WF" 2>/dev/null || true)
 [ -z "$calls" ] && ok "no job calls another workflow" || { bad "a job calls another workflow — its environment secrets would not arrive:"; printf '%s\n' "$calls" | sed 's/^/        /'; }
 callable=$(grep -lE '^[[:space:]]+workflow_call:' "$WF"/*.y*ml 2>/dev/null || true)
@@ -508,7 +505,7 @@ callable=$(grep -lE '^[[:space:]]+workflow_call:' "$WF"/*.y*ml 2>/dev/null || tr
 # the answer: a missing file's error read as its sha, a 404 read as a count.
 # Continuation lines are joined first, so a call split over lines is caught.
 head_ "gh api results are judged by exit status, never by a fallback in the substitution"
-for f in "$WF"/*.y*ml scripts/*.sh; do
+for f in "$WF"/*.y*ml scripts/*.sh scripts/withdraw/*.sh; do
   awk -v F="$f" '
     # Comments are prose, and may quote the pattern — as this rule does.
     buf == "" && /^[[:space:]]*#/ { next }
@@ -519,6 +516,38 @@ for f in "$WF"/*.y*ml scripts/*.sh; do
 done > /tmp/_ghfb.txt
 if [ -s /tmp/_ghfb.txt ]; then bad "gh api with an in-substitution fallback:"; sed 's/^/        /' /tmp/_ghfb.txt; else ok "none"; fi
 rm -f /tmp/_ghfb.txt
+
+# ── 12f. every undo job waits for its own approval ───────────────────────────
+# Approving a release is not approving its deletion. The rollback_* jobs of a
+# release and the withdraw_* jobs of a withdrawal remove what was published, so
+# each must need its confirm job directly and run only once that job succeeded,
+# and the confirm job must sit in the approval environment. Reachability alone
+# (rule 5) would pass a rollback job hanging off the release's own approval.
+head_ "Every undo job waits for its own approval"
+for f in "$WF"/*.y*ml; do
+  awk -v F="$(basename "$f")" -v APPROVAL="${APPROVAL_ENV:-release-approval}" '
+    /^jobs:/ {injobs=1; next}
+    injobs && /^  #/ { next }
+    injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job=$1; sub(/:$/,"",job); order[++m]=job; next }
+    injobs && job != "" && /^    needs:/ { needs[job] = $0 }
+    injobs && job != "" && /^    if:/ { cond[job] = $0 }
+    injobs && job != "" && /^    environment:/ { env[job] = $2 }
+    END {
+      for (i = 1; i <= m; i++) {
+        j = order[i]
+        if (j !~ /^(rollback|withdraw)_/ || j == "rollback_plan" || j == "rollback_confirm") continue
+        c = (j ~ /^rollback_/) ? "rollback_confirm" : "confirm"
+        if (env[c] != APPROVAL) { printf "  FAIL  %s:%s — %s is not in %s\n", F, j, c, APPROVAL; continue }
+        if (needs[j] !~ ("[[ ,]" c "[],]") || index(cond[j], "needs." c ".result == '\''success'\''") == 0)
+          printf "  FAIL  %s:%s does not wait for %s\n", F, j, c
+        else
+          printf "  ok    %s:%s waits for %s\n", F, j, c
+      }
+    }
+  ' "$f"
+done > /tmp/_undo.txt
+[ -s /tmp/_undo.txt ] && cat /tmp/_undo.txt || echo "  ok    no undo jobs"
+grep -q FAIL /tmp/_undo.txt && FAIL=1; rm -f /tmp/_undo.txt
 
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable
