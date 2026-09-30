@@ -111,9 +111,11 @@ jobs:
             echo '```'; echo "$PRE"; echo '```'
           } > /tmp/body.txt
 
+          # Exit status, not output: on an error gh prints the error body to stdout.
           CID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
             --jq '.[] | select(.body | startswith("<!-- workflow-security-zizmor -->")) | .id' \
-            2>/dev/null | head -1 || true)
+            2>/dev/null) || CID=""
+          CID=$(printf '%s\n' "$CID" | head -1)
           if [ -n "$CID" ]; then
             gh api --method PATCH "repos/${REPO}/issues/comments/${CID}" -F body=@/tmp/body.txt >/dev/null
           else

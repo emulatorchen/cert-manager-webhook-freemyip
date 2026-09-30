@@ -135,9 +135,12 @@ jobs:
           # An earlier attempt that failed and was not rolled back leaves the
           # chart repository advertising this version, and chart-releaser would
           # then fail half-way through. Refuse up front and say how to clear it.
-          pages="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}"
-          if curl -fsS --retry 3 --max-time 30 "${pages}/index.yaml" 2>/dev/null \
-             | grep -qE "^[[:space:]]+version: ${version}\$"; then
+          #
+          # Read from the gh-pages branch, not the Pages site: the site lags the
+          # branch by a build and a CDN cache, so a withdrawal completed minutes
+          # ago would still look live there and block a legitimate retry.
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null \
+             | base64 -d | grep -qE "^[[:space:]]+version: ${version}\$"; then
             echo "::error::the chart repository already advertises ${version}, left by an earlier attempt that was not rolled back. Run 'Withdraw a release' for ${version}, then release again."
             exit 1
           fi
@@ -1187,8 +1190,12 @@ jobs:
             # The directory's own README explains the directory, not the site.
             [ "$name" = "README.md" ] && continue
             local_b64=$(base64 < "$src" | tr -d '\n')
-            remote_b64=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" \
-                           --jq '.content' 2>/dev/null | tr -d '\n' || true)
+            # Exit status, not output: on an error gh prints the error body to stdout.
+            if remote_b64=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.content' 2>/dev/null); then
+              remote_b64=$(printf '%s' "$remote_b64" | tr -d '\n')
+            else
+              remote_b64=""
+            fi
             # The API returns base64 wrapped at 60 columns; compare the decoded
             # bytes so re-wrapping alone never looks like a change.
             if [ -n "$remote_b64" ] \
@@ -1201,7 +1208,7 @@ jobs:
             # and the Docker Hub version tag is only committed once all of that
             # succeeded — a page that silently failed to publish would let an
             # immutable tag be committed alongside a stale page.
-            sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha' 2>/dev/null || true)
+            sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha' 2>/dev/null) || sha=""
             if [ -n "$sha" ]; then
               if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
                      -f message="Update ${name} for ${VERSION}" \
@@ -1279,8 +1286,9 @@ jobs:
             prev=$(git tag --sort=-creatordate --list 'v*' | grep -v "^${TAG}$" | head -1)
             generated=""
             if [ -n "$prev" ]; then
+              # Exit status, not output: on an error gh prints the error body to stdout.
               generated=$(gh api "repos/${REPO}/releases/generate-notes" \
-                -f tag_name="$TAG" -f previous_tag_name="$prev" --jq '.body' || true)
+                -f tag_name="$TAG" -f previous_tag_name="$prev" --jq '.body' 2>/dev/null) || generated=""
             fi
             body="$NOTES"
             [ -n "$generated" ] && body="${body}"$'\n\n'"${generated}"
@@ -1294,10 +1302,9 @@ jobs:
       # hub.docker.com/v2 returns 403 for access tokens. That password is the
       # strongest credential this project holds — it can delete repositories and
       # mint new tokens — so it lives in its own environment, dockerhub-metadata,
-      # readable only by update_dockerhub_description.yaml. A job can declare
-      # exactly one environment, and this one needs `release`, so keeping the
-      # refresh here would mean putting the account password alongside the
-      # publish credentials. Isolation wins over the convenience.
+      # readable only by the dockerhub_description job. A job can declare exactly
+      # one environment, so keeping the refresh here would mean putting the
+      # account password alongside the publish credentials.
       # A release that exists but is a draft, or has no chart attached, is a
       # dead install route that every other job would go on to advertise.
       - name: Verify the release is published with its chart
@@ -1429,22 +1436,41 @@ jobs:
             echo "${img}:latest -> ${l}"
           done
 
+  # The Docker Hub page, after the scan so it carries it. A top-level job, not a
+  # call to another workflow: a called workflow's job never received its
+  # environment's secrets — release #6 and the 0.1.1 rollback both read the
+  # account password as empty — while top-level jobs always have. The page is
+  # written by a script in this repository, so the account password reaches
+  # reviewed code and no third-party action.
   dockerhub_description:
     name: "Refresh the Docker Hub page"
-    # After the scan, so the page Docker Hub receives already carries it. It
-    # still runs if that job failed — the page is then simply the committed
-    # version without a fresh scan, which is better than no page at all, and the
-    # reusable workflow falls back on its own.
     needs: [resolve, release_approval, promote_latest, post_release_report]
-    if: always() && needs.promote_latest.result == 'success'
+    if: |
+      always() && needs.promote_latest.result == 'success' &&
+      needs.post_release_report.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
     permissions:
       contents: read
-    uses: ./.github/workflows/update_dockerhub_description.yaml
-    with:
-      version: ${{ needs.resolve.outputs.version }}
-      page_artifact: scan-pages
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # The page exactly as the release composed it, scan included.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan-pages
+      - name: Publish the page and read it back
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/dockerhub_page.sh "$HUB_REPO" docs/dockerhub_description.md
 
   # Scan what was actually published, not what was built. The image on the
   # registry is the one people pull, and advisories land after a release as
@@ -1752,15 +1778,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ROLLBACK. Anything after the first push that fails before the commit is
-  # reverted by the same workflow that withdraws a finished release, so there
-  # is one path back and it is the reverse of publication order. It asks for its
-  # own approval before deleting anything, and skips whatever was never
-  # published. The Docker Hub version tag cannot be among what it finds: that
-  # tag only exists once commit_tag has succeeded, and then this does not run.
+  # reverted by the same workflow that withdraws a finished release — started
+  # here as its own run rather than called, because a called workflow's jobs
+  # never received their environments' secrets, and the withdrawal needs them.
+  # That run deletes nothing until it is approved under release-approval.
   #
-  # A called workflow can only narrow the token, never widen it, so this grants
-  # the union of what the withdraw jobs need; each job there declares its own,
-  # smaller, set.
+  # actions: write is what starting a workflow takes, and it could start any of
+  # them; validate.sh allows it to this one job only, behind the approval, and
+  # the version it hands over is the one this run resolved.
   rollback:
     name: "Roll back the unfinished release"
     needs: [resolve, publish_image, commit_tag]
@@ -1768,14 +1793,50 @@ jobs:
       always() && needs.resolve.result == 'success' &&
       (needs.publish_image.outputs.push_attempted == 'true' || needs.publish_image.result == 'cancelled') &&
       needs.commit_tag.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      contents: write
-      issues: write
-      packages: write
-      attestations: write
-    uses: ./.github/workflows/withdraw_release.yaml
-    with:
-      version: ${{ needs.resolve.outputs.version }}
-      confirm: ${{ needs.resolve.outputs.version }}
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      contents: read
+      actions: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Start the withdrawal of this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::'${VERSION}' is not X.Y.Z"; exit 1; }
+          before=$(gh run list --repo "$REPO" --workflow withdraw_release.yaml --limit 1 \
+                     --json databaseId --jq '.[0].databaseId // 0')
+          if ! gh workflow run withdraw_release.yaml --repo "$REPO" --ref "$BRANCH" \
+                 -f version="$VERSION" -f confirm="$VERSION"; then
+            echo "::error::could not start the rollback. Start 'Withdraw a release' for ${VERSION} by hand — it is safe to run more than once."
+            exit 1
+          fi
+          id=""
+          for _ in $(seq 1 20); do
+            id=$(gh run list --repo "$REPO" --workflow withdraw_release.yaml --limit 1 \
+                   --json databaseId --jq '.[0].databaseId // 0')
+            [ "$id" != "$before" ] && break
+            sleep 3
+          done
+          url="https://github.com/${REPO}/actions/runs/${id}"
+          {
+            echo "## Rolling back ${VERSION}"
+            echo ""
+            echo "This release stopped before its Docker Hub version tag, so nothing"
+            echo "irreversible was published. The withdrawal is running as its own run:"
+            echo ""
+            echo "${url}"
+            echo ""
+            echo "It deletes nothing until you approve it under **release-approval**."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rollback started: ${url}"
+          # This run still ends red: the release did not happen.
+          exit 1

@@ -65,19 +65,9 @@ on:
         required: true
         type: string
   # Also the release's rollback: a release that fails before its Docker Hub
-  # version tag is committed is reverted by exactly this, so there is one path
-  # back and it is tested by both uses. The approval below still applies.
-  workflow_call:
-    inputs:
-      version:
-        required: true
-        type: string
-      confirm:
-        required: true
-        type: string
-    secrets:
-      DOCKERHUB_USERNAME:
-        required: false
+  # version tag is committed starts this as its own run. Not a call — a called
+  # workflow's jobs never received their environments' secrets. The approval
+  # below applies either way.
 
 # Its own group, not the release group: a withdrawal must not queue behind a
 # release, and a release must not be cancelled by a withdrawal.
@@ -317,6 +307,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      hub_changed: ${{ steps.changed.outputs.hub }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -333,6 +325,19 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
         run: ./scripts/rollback_scan.sh "$VERSION" README.md docs/dockerhub_description.md
+
+      # The Docker Hub page is only rewritten when its source actually changed.
+      # A release that failed before recording its scan never touched it, and
+      # the 0.1.1 rollback showed what an unneeded page write costs: it failed
+      # and held back every deletion behind it.
+      - name: Did the Docker Hub page change?
+        id: changed
+        run: |
+          if git diff --quiet HEAD -- docs/dockerhub_description.md; then
+            echo "hub=false" >> "$GITHUB_OUTPUT"; echo "Docker Hub page unchanged"
+          else
+            echo "hub=true" >> "$GITHUB_OUTPUT"; echo "Docker Hub page changed"
+          fi
 
       # The Docker Hub job and the issue job both work from exactly this file,
       # so the Hub page, the README and the CVE issues cannot end up describing
@@ -424,20 +429,36 @@ jobs:
             fi
           done
 
-  # Refreshed through the same reusable workflow a release uses, so it is
-  # verified the same way: the page must end up byte-for-byte what was sent.
+  # Written by the same script a release uses, from a top-level job so its
+  # environment's secrets arrive, and read back byte for byte. Only when the
+  # page's source actually changed.
   withdraw_hub_page:
     name: "0. Roll back the Docker Hub page"
     needs: [plan, withdraw_pages]
-    if: always() && needs.withdraw_pages.result == 'success'
+    if: always() && needs.withdraw_pages.result == 'success' && needs.withdraw_pages.outputs.hub_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
     permissions:
       contents: read
-    uses: ./.github/workflows/update_dockerhub_description.yaml
-    with:
-      version: ${{ needs.plan.outputs.version }}
-      page_artifact: scan-pages-restored
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan-pages-restored
+      - name: Publish the page and read it back
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/dockerhub_page.sh "$HUB_REPO" docs/dockerhub_description.md
 
   # ── 0. the CVE list as issues ──────────────────────────────────────────────
   # The release opens one [SECURITY] issue per finding and comments on existing
@@ -525,7 +546,11 @@ jobs:
   withdraw_latest:
     name: "1. Move latest back"
     needs: [plan, confirm, withdraw_pages, withdraw_hub_page, withdraw_issues]
-    if: always() && needs.confirm.result == 'success' && needs.withdraw_pages.result == 'success' && needs.withdraw_hub_page.result == 'success' && needs.withdraw_issues.result == 'success'
+    if: |
+      always() && needs.confirm.result == 'success' &&
+      needs.withdraw_pages.result == 'success' &&
+      (needs.withdraw_hub_page.result == 'success' || needs.withdraw_hub_page.result == 'skipped') &&
+      needs.withdraw_issues.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -625,7 +650,8 @@ jobs:
           PREV: ${{ needs.plan.outputs.prev }}
         run: |
           set -uo pipefail
-          was_latest=$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          # Exit status, not output: on an error gh prints the error body to stdout.
+          was_latest=$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null) || was_latest=""
           # Both names: ours, and the one chart-releaser makes for itself.
           for name in "v${VERSION}" "cert-manager-webhook-freemyip-${VERSION}"; do
             if ! gh release view "$name" --repo "$REPO" >/dev/null 2>&1; then
@@ -874,21 +900,36 @@ jobs:
             esac
           fi
 
-  report:
-    name: "What was withdrawn"
-    needs: [plan, withdraw_pages, withdraw_hub_page, withdraw_issues, withdraw_latest, withdraw_records, withdraw_packages, withdraw_image, withdraw_attestations]
-    if: always() && needs.plan.outputs.found == '1'
+  # The withdrawal proves itself. Every place the version could have been
+  # published is checked from outside, independently of the steps that removed
+  # it, and the run fails if anything is still there — or if the release now
+  # live was disturbed. A green run means withdrawn, not "the steps ran".
+  verify:
+    name: "Verify: nothing of this version is left"
+    needs: [plan, confirm, withdraw_pages, withdraw_hub_page, withdraw_issues, withdraw_latest, withdraw_records, withdraw_packages, withdraw_image, withdraw_attestations]
+    if: always() && needs.confirm.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+      issues: read
+      packages: read
+      attestations: read
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      - name: Summarise
+      - name: Check every location
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          HUB_KEPT: ${{ needs.withdraw_image.outputs.removed == 'false' }}
           R_PAGES: ${{ needs.withdraw_pages.result }}
           R_HUBPAGE: ${{ needs.withdraw_hub_page.result }}
           R_ISSUES: ${{ needs.withdraw_issues.result }}
@@ -898,21 +939,81 @@ jobs:
           R_IMAGE: ${{ needs.withdraw_image.result }}
           R_ATTEST: ${{ needs.withdraw_attestations.result }}
         run: |
+          set -uo pipefail
+          fails=0
+          row() { printf '| %s | %s | %s |\n' "$1" "$2" "$3" >> "$GITHUB_STEP_SUMMARY"; }
+          present() { if "$@" >/dev/null 2>&1; then echo present; else echo absent; fi; }
+          check() {  # label, observed, expected
+            if [ "$2" = "$3" ]; then row "$1" "$2" "ok"; else row "$1" "$2" "**FAIL** — expected ${3}"; fails=$((fails + 1)); fi
+          }
           {
-            echo "## Withdrawn: \`${VERSION}\`"
+            echo "## Withdrawal of \`${VERSION}\`: verified from outside"
             echo ""
-            echo "| Step | Result |"
-            echo "|---|---|"
-            echo "| 0. README scan, gh-pages page sources | ${R_PAGES} |"
-            echo "| 0. Docker Hub page | ${R_HUBPAGE} |"
-            echo "| 0. CVE issues | ${R_ISSUES} |"
-            echo "| 1. latest | ${R_LATEST} |"
-            echo "| 2–3. releases, tags, Latest marker, chart index | ${R_RECORDS} |"
-            echo "| 4. ghcr chart and image | ${R_PACKAGES} |"
-            echo "| 5. Docker Hub version tag | ${R_IMAGE} |"
-            echo "| 6. attestation records | ${R_ATTEST} |"
+            echo "Steps: pages ${R_PAGES}, Docker Hub page ${R_HUBPAGE}, issues ${R_ISSUES}, latest ${R_LATEST},"
+            echo "records ${R_RECORDS}, ghcr ${R_PACKAGES}, Docker Hub tag ${R_IMAGE}, attestations ${R_ATTEST}."
             echo ""
-            echo "Each step runs only if the one before it succeeded, so a failure"
-            echo "stops the unwind with what remains still consistent. Fix the cause"
-            echo "and re-run: every step skips what is already gone."
+            echo "| Location | Observed | Result |"
+            echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Exit status, not output: on an error gh prints the error body to stdout.
+          if idx=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null); then
+            idx=$(printf '%s' "$idx" | base64 -d)
+          else
+            idx=""
+          fi
+          check "chart index advertises ${VERSION}" "$(printf '%s' "$idx" | grep -cE "^[[:space:]]+version: ${VERSION}$")" "0"
+          check ".tgz for ${VERSION} on gh-pages" "$(present gh api "repos/${REPO}/contents/cert-manager-webhook-freemyip-${VERSION}.tgz?ref=gh-pages")" "absent"
+          for name in "v${VERSION}" "cert-manager-webhook-freemyip-${VERSION}"; do
+            check "release ${name}" "$(present gh release view "$name" --repo "$REPO")" "absent"
+            check "git tag ${name}" "$(present gh api "repos/${REPO}/git/ref/tags/${name}")" "absent"
+          done
+          for f in README.md docs/dockerhub_description.md; do
+            shows=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}" --jq '.content' | base64 -d \
+                      | awk '/scan:begin/{b=1;next}/scan:end/{b=0}b' | grep -cF ":${VERSION}\`,")
+            check "scan on ${f} shows ${VERSION}" "$shows" "0"
+          done
+          opened=$(gh issue list --repo "$REPO" --label security --state open --limit 200 --json body --jq '.[].body' \
+                     | grep -cF "**Detected in release:** \`v${VERSION}\`" || true)
+          check "open CVE issues opened by v${VERSION}" "${opened:-0}" "0"
+
+          hub_tag=$(curl -s -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/")
+          if [ "$HUB_KEPT" = "true" ]; then
+            check "Docker Hub ${VERSION} (immutable, stays)" "$hub_tag" "200"
+          else
+            check "Docker Hub ${VERSION}" "$hub_tag" "404"
+          fi
+          for pkg in "cert-manager-webhook-freemyip" "charts%2Fcert-manager-webhook-freemyip"; do
+            n=$(gh api --paginate "users/${OWNER}/packages/container/${pkg}/versions" \
+                  --jq "[.[] | select(.metadata.container.tags | index(\"${VERSION}\"))] | length" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+            check "ghcr ${pkg//%2F//} tagged ${VERSION}" "$n" "0"
+          done
+          if [ -n "$DIGEST" ]; then
+            hub_latest=$(curl -s "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/latest/" | jq -r '.digest // "none"')
+            if [ "$hub_latest" = "$DIGEST" ]; then check "Docker Hub latest" "still ${VERSION}" "moved off it"; else row "Docker Hub latest" "$hub_latest" "ok"; fi
+            if [ "$HUB_KEPT" != "true" ]; then
+              # Exit status, not output: on an error gh prints the error body to stdout.
+              # A 404 means none are left; any other failure is not a pass.
+              if att=$(gh api "repos/${REPO}/attestations/${DIGEST}" --jq '.attestations | length' 2>/dev/null); then
+                :
+              elif printf '%s' "$att" | grep -q '"status":"404"'; then
+                att=0
+              else
+                att="unreadable"
+              fi
+              check "attestation records for the digest" "$att" "0"
+            fi
+          fi
+
+          # The release now live must be untouched.
+          if [ -n "$PREV" ]; then
+            check "release v${PREV} (live)" "$(present gh release view "v${PREV}" --repo "$REPO")" "present"
+            check "chart index advertises ${PREV}" "$(printf '%s' "$idx" | grep -cE "^[[:space:]]+version: ${PREV}$")" "1"
+            check "Docker Hub ${PREV}" "$(curl -s -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${PREV}/")" "200"
+          fi
+
+          if [ "$fails" -gt 0 ]; then
+            echo "::error::${fails} location(s) still hold ${VERSION}, or the live release was disturbed — see the summary. Re-run this workflow once the cause is fixed; every step skips what is already gone."
+            exit 1
+          fi
+          echo "${VERSION} is withdrawn everywhere it can be"

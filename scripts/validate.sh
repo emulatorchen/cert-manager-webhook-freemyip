@@ -406,11 +406,11 @@ grep -q FAIL /tmp/_sec.txt && FAIL=1; rm -f /tmp/_sec.txt
 # Docker Hub publish token, approved or not. What has to hold is that every such
 # job is the approval job or descends from it through `needs`.
 #
-# dockerhub-metadata is deliberately not listed: its job refreshes the Hub page
-# on its own when the page source changes on main, by the user's decision to
-# keep one approval per release.
+# dockerhub-metadata is listed too: the Docker Hub account password is used
+# only by a release or a withdrawal, after the approval, and by nothing that
+# runs on its own.
 head_ "Credential environments are reachable only through the approval"
-CRED_ENVS="${CRED_ENVS:-release}"
+CRED_ENVS="${CRED_ENVS:-release dockerhub-metadata}"
 for f in "$WF"/*.y*ml; do
   awk -v F="$(basename "$f")" -v APPROVAL="${APPROVAL_ENV:-release-approval}" -v CRED="$CRED_ENVS" '
     BEGIN { n = split(CRED, c, " "); for (i = 1; i <= n; i++) cred[c[i]] = 1 }
@@ -461,7 +461,7 @@ for f in "$WF"/*.y*ml; do
     injobs && job != "" && /^    environment:/ { if ($2 == APPROVAL) approver[job]=1 }
     injobs && job != "" && /^    permissions:/ { inperm=1; next }
     injobs && job != "" && inperm && /^    [a-z]/ { inperm=0 }
-    injobs && job != "" && inperm && /^      packages:[[:space:]]*write/ { pw[job]=1 }
+    injobs && job != "" && inperm && /^      (packages|actions):[[:space:]]*write/ { pw[job]=1 }
     END {
       for (pass = 1; pass <= m; pass++) {
         changed = 0
@@ -484,6 +484,41 @@ for f in "$WF"/*.y*ml; do
 done > /tmp/_pkg.txt
 [ -s /tmp/_pkg.txt ] && cat /tmp/_pkg.txt || echo "  ok    no job asks for packages: write"
 grep -q FAIL /tmp/_pkg.txt && FAIL=1; rm -f /tmp/_pkg.txt
+
+# ── 12d. at most one job may start workflows, and only behind the approval ────
+# actions: write lets a job start any workflow in the repository. The release
+# needs it for exactly one thing — starting the withdrawal of a release that
+# failed before its commit — so exactly one job may hold it, and it must sit
+# behind release-approval like every other job that changes something.
+# No workflow here is called by another: a called workflow's jobs never
+# received their environments' secrets.
+head_ "Only the rollback can start workflows; nothing is a called workflow"
+aw=$(grep -rlE '^[[:space:]]+actions:[[:space:]]*write' "$WF" 2>/dev/null | wc -l | tr -d ' ')
+awjobs=$(awk '/^jobs:/{j=1;next} j && /^  [A-Za-z0-9_-]+:[[:space:]]*$/{job=$1} j && /^      actions:[[:space:]]*write/{print FILENAME":"job}' "$WF"/*.y*ml)
+n_aw=$(printf '%s' "$awjobs" | grep -c . || true)
+if [ "$n_aw" -le 1 ]; then ok "jobs with actions: write: ${n_aw} ${awjobs}"; else bad "more than one job can start workflows: $(printf '%s' "$awjobs" | tr '\n' ' ')"; fi
+calls=$(grep -rnE '^[[:space:]]+uses:[[:space:]]*\./\.github/workflows/' "$WF" 2>/dev/null || true)
+[ -z "$calls" ] && ok "no job calls another workflow" || { bad "a job calls another workflow — its environment secrets would not arrive:"; printf '%s\n' "$calls" | sed 's/^/        /'; }
+callable=$(grep -lE '^[[:space:]]+workflow_call:' "$WF"/*.y*ml 2>/dev/null || true)
+[ -z "$callable" ] && ok "no workflow is callable" || bad "callable workflows: ${callable}"
+
+# ── 12e. a failed gh api call is judged by its exit status ───────────────────
+# On an error, gh prints the response body — the error JSON — to stdout. So
+# `x=$(gh api ... || true)` or `|| echo 0` keeps that error text as if it were
+# the answer: a missing file's error read as its sha, a 404 read as a count.
+# Continuation lines are joined first, so a call split over lines is caught.
+head_ "gh api results are judged by exit status, never by a fallback in the substitution"
+for f in "$WF"/*.y*ml scripts/*.sh; do
+  awk -v F="$f" '
+    # Comments are prose, and may quote the pattern — as this rule does.
+    buf == "" && /^[[:space:]]*#/ { next }
+    { line = $0; if (buf != "") { buf = buf " " line } else { buf = line; start = NR } }
+    /\\$/ { sub(/\\$/, "", buf); next }
+    { if (buf ~ /\$\(gh api/ && buf ~ /\|\|[[:space:]]*(true|echo)[^)]*\)/) printf "%s:%d\n", F, start; buf = "" }
+  ' "$f"
+done > /tmp/_ghfb.txt
+if [ -s /tmp/_ghfb.txt ]; then bad "gh api with an in-substitution fallback:"; sed 's/^/        /' /tmp/_ghfb.txt; else ok "none"; fi
+rm -f /tmp/_ghfb.txt
 
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable
