@@ -143,10 +143,10 @@ spec:
 
 ## Vulnerability scan
 
-<!-- scan:begin -->
-_Populated by the release workflow. Until the first release publishes one, there
-is no scan to show here._
-<!-- scan:end -->
+Every release scans the image it actually published and puts the result at the
+end of its release notes, with the severity counts first:
+[scan of the latest release](https://github.com/emulatorchen/cert-manager-webhook-freemyip/releases/latest#vulnerability-scan).
+Each earlier release keeps its own scan in its own notes.
 
 ## Common questions
 

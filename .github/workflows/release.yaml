@@ -741,12 +741,12 @@ jobs:
             echo "1. the image, by digest, on ghcr and Docker Hub — no Docker Hub tag yet"
             echo "2. the chart on the OCI registry, pinned to that digest"
             echo "3. the chart repository index on gh-pages"
-            echo "4. the GitHub release and the \`v${VERSION}\` tag"
-            echo "5. \`latest\`, then the vulnerability scan and the pages"
+            echo "4. the GitHub release and the \`v${VERSION}\` tag, with the vulnerability scan in its notes"
+            echo "5. \`latest\`, then the Docker Hub page and the CVE issues"
             echo "6. **commit:** the Docker Hub version tag — immutable, so it comes last"
             echo ""
-            echo "Anything failing before step 6 is rolled back, behind its own approval."
-            echo "Nothing irreversible exists until step 6 succeeds."
+            echo "Anything failing before step 6 is rolled back further down this same run,"
+            echo "behind its own approval. Nothing irreversible exists until step 6 succeeds."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # The first write of the release: the image, pushed by digest.
@@ -1232,16 +1232,100 @@ jobs:
             echo "page sources already current"
           fi
 
+  # Scan what was actually published, not what was built. The image on the
+  # registry is the one people pull, and advisories land after a release as
+  # often as before one.
+  #
+  # Before the GitHub release, because the scan is part of its notes. The notes
+  # are where the scan lives: each release carries its own, the previous release
+  # keeps its own, and a withdrawn release takes its scan with it. Nothing is
+  # committed to the default branch, which the branch ruleset rightly refuses to
+  # a workflow.
+  scan_published:
+    name: "Scan the published image"
+    needs: [resolve, release_approval, publish_image]
+    if: always() && needs.release_approval.result == 'success' && needs.publish_image.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Read only, apart from the code-scanning upload. This job runs a
+      # third-party scanner and renders attacker-influenceable strings (package
+      # names and CVE text out of somebody else's advisory database) into
+      # markdown. It must not also hold a token that can change the repository.
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan the released image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-released.sarif
+          exit-code: 0
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-released.sarif
+          category: trivy-released
+
+      # Every severity, not only the blocking ones. A table that quietly
+      # omitted MEDIUM would be a more misleading number than no table at all.
+      # The CVE issues still filter to CRITICAL and HIGH themselves.
+      - name: Scan again as JSON, all severities
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          trivyignores: .trivyignore
+          format: json
+          output: trivy-released.json
+          exit-code: 0
+
+      # Docker Hub scans one repository per account, so the scan its page would
+      # otherwise show is information this project loses. Rendered from our own
+      # scan of the image that was actually published, once, and used as is by
+      # the release notes and the Docker Hub page, so the two cannot disagree.
+      - name: Render the scan
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/render_scan.sh trivy-released.json \
+            "${HUB_IMAGE}:${VERSION}" "$(date -u +%Y-%m-%d)" > scan.md
+          cat scan.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the scan on
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan
+          path: |
+            scan.md
+            trivy-released.json
+          if-no-files-found: error
+
   github_release:
     name: "Create GitHub release"
-    # Announced last, once the image, the OCI chart and the index all serve this
+    # Announced once the image, the OCI chart and the index all serve this
     # version, so the release list never points at something not yet published.
-    needs: [resolve, release_approval, publish_image, publish_chart_oci, publish_chart_index]
+    needs: [resolve, release_approval, publish_image, publish_chart_oci, publish_chart_index, scan_published]
     if: |
       always() && needs.release_approval.result == 'success' &&
       needs.publish_image.result == 'success' &&
       needs.publish_chart_oci.result == 'success' &&
-      needs.publish_chart_index.result == 'success'
+      needs.publish_chart_index.result == 'success' &&
+      needs.scan_published.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1258,10 +1342,17 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: chart-release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan
 
-      # gh release create makes the tag, so nothing pushes a ref before the
-      # artifacts are actually published.
-      - name: Create the release
+      # The notes: the text given at dispatch, then the changes since the last
+      # release, then the scan between its markers. The scan goes in through
+      # apply_scan.sh, which refuses markup, markers and unsafe links a second
+      # time. The notes must hold exactly one marker pair: that is how a
+      # withdrawal finds the live release's scan again, and a pull request title
+      # carrying a marker must not be able to move it.
+      - name: Write the release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1269,45 +1360,44 @@ jobs:
           NOTES: ${{ inputs.notes }}
           OVERRIDE: ${{ inputs.override_notes }}
         run: |
-          set -euo pipefail
-          if [ -z "$NOTES" ]; then
-            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          elif [ "$OVERRIDE" = "true" ]; then
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          else
-            # Prepend the supplied text to the generated notes, rather than
-            # making the author choose between context and a changelog.
+          set -uo pipefail
+          generated=""
+          if [ "$OVERRIDE" != "true" ]; then
             # v* only. chart-releaser tags cert-manager-webhook-freemyip-<version>
-            # minutes earlier in this same run, so an unfiltered list returns
-            # that tag as "previous" and the generated notes cover an empty
-            # range — every release after the first would ship blank notes.
-            prev=$(git tag --sort=-creatordate --list 'v*' | grep -v "^${TAG}$" | head -1)
-            generated=""
-            if [ -n "$prev" ]; then
-              # Exit status, not output: on an error gh prints the error body to stdout.
-              generated=$(gh api "repos/${REPO}/releases/generate-notes" \
-                -f tag_name="$TAG" -f previous_tag_name="$prev" --jq '.body' 2>/dev/null) || generated=""
-            fi
-            body="$NOTES"
-            [ -n "$generated" ] && body="${body}"$'\n\n'"${generated}"
-            gh release create "$TAG" --title "$TAG" --notes "$body" --latest \
-              cert-manager-webhook-freemyip-*.tgz
+            # minutes earlier in this run; taken as "previous", it would leave
+            # the generated notes covering an empty range.
+            prev=$(git tag --sort=-creatordate --list 'v*' | grep -vxF "$TAG" | head -1)
+            args=(-f tag_name="$TAG")
+            if [ -n "$prev" ]; then args+=(-f previous_tag_name="$prev"); fi
+            generated=$(gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq '.body') \
+              || { echo "::error::could not generate the release notes"; exit 1; }
           fi
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            if [ -n "$generated" ]; then printf '%s\n\n' "$generated"; fi
+            printf '%s\n%s\n' '<!-- scan:begin -->' '<!-- scan:end -->'
+          } > notes.md
+          for m in 'scan:begin' 'scan:end'; do
+            [ "$(grep -c "$m" notes.md)" = "1" ] \
+              || { echo "::error::the release notes carry a second ${m} marker; remove it from the notes text or the pull request title"; exit 1; }
+          done
+          ./scripts/apply_scan.sh scan.md notes.md || exit 1
 
-      # The Docker Hub page is deliberately NOT refreshed here.
-      #
-      # Updating it needs the Docker Hub account password, not a registry token:
-      # hub.docker.com/v2 returns 403 for access tokens. That password is the
-      # strongest credential this project holds — it can delete repositories and
-      # mint new tokens — so it lives in its own environment, dockerhub-metadata,
-      # readable only by the dockerhub_description job. A job can declare exactly
-      # one environment, so keeping the refresh here would mean putting the
-      # account password alongside the publish credentials.
-      # A release that exists but is a draft, or has no chart attached, is a
-      # dead install route that every other job would go on to advertise.
-      - name: Verify the release is published with its chart
+      # gh release create makes the tag, so nothing pushes a ref before the
+      # artifacts are actually published.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --latest \
+            cert-manager-webhook-freemyip-*.tgz
+
+      # A release that is a draft, lacks its chart, or does not carry the scan
+      # is a dead install route or a missing statement that every later job
+      # would go on to advertise.
+      - name: Verify the release is published with its chart and scan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1315,14 +1405,20 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          json=$(gh release view "$TAG" --repo "$REPO" --json isDraft,assets,tagName) \
+          json=$(gh release view "$TAG" --repo "$REPO" --json isDraft,assets,body) \
             || { echo "::error::release ${TAG} does not exist after creating it"; exit 1; }
           [ "$(printf '%s' "$json" | jq -r '.isDraft')" = "false" ] \
             || { echo "::error::release ${TAG} is a draft — nobody can download it"; exit 1; }
           want="cert-manager-webhook-freemyip-${VERSION}.tgz"
           printf '%s' "$json" | jq -e --arg a "$want" '.assets | map(.name) | index($a) != null' >/dev/null \
             || { echo "::error::release ${TAG} does not carry ${want}"; exit 1; }
-          echo "release ${TAG} is published and carries ${want}"
+          block() { awk 'index($0,"<!-- scan:end -->"){f=0} f{print} index($0,"<!-- scan:begin -->"){f=1}'; }
+          printf '%s\n' "$(printf '%s' "$json" | jq -r '.body')" | block > got-scan.md
+          if ! diff -q scan.md got-scan.md >/dev/null; then
+            echo "::error::the notes of ${TAG} do not carry the scan this run rendered"
+            exit 1
+          fi
+          echo "release ${TAG} is published, carries ${want} and the scan"
 
       - name: Summarise
         env:
@@ -1335,27 +1431,19 @@ jobs:
             echo "### Released ${TAG}"
             echo ""
             echo "- \`${GHCR_IMAGE}:${VERSION}\`"
-            echo "- \`${HUB_IMAGE}:${VERSION}\`"
+            echo "- \`${HUB_IMAGE}:${VERSION}\` (the tag is committed last)"
             echo "- chart \`${VERSION}\` pushed to the ghcr OCI registry"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The Docker Hub page refreshed as part of the release, but through a called
-  # workflow whose job declares environment: dockerhub-metadata. Environment
-  # scoping is per job, so that job reads the account password and no other job
-  # in this run — publish_image and github_release included — can reach it.
-  #
-  # Only DOCKERHUB_USERNAME is handed over, explicitly rather than by
-  # `secrets: inherit`, so the callee receives one value and nothing else.
-  # The last write of the release, and the only mutable pointer in it.
+  # The only mutable pointer in the release.
   #
   # By the time this runs, all three install routes and the release list already
   # serve this version, so `latest` never points at something nothing else
-  # advertises. Every earlier failure leaves `latest` on the previous good
-  # release, which is the property that makes a failed release harmless.
+  # advertises.
   #
   # imagetools create copies the manifest list by digest rather than rebuilding,
   # so `latest` is byte-for-byte the image that was scanned, attested and
-  # published — and the attestation still resolves.
+  # published, and the attestation still resolves.
   promote_latest:
     name: "Move latest to the released version"
     needs: [resolve, release_approval, publish_image, github_release]
@@ -1398,7 +1486,7 @@ jobs:
 
       # ghcr first: its tags are overwritable, so a failure between the two
       # leaves the recoverable registry moved and the one with immutable version
-      # tags untouched. A retry then corrects ghcr and completes Docker Hub.
+      # tags untouched.
       - name: Point latest at the released version
         env:
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
@@ -1411,8 +1499,7 @@ jobs:
           docker buildx imagetools create --tag "${HUB_IMAGE}:latest"  "${HUB_IMAGE}@${DIGEST}"
           echo "latest now points at ${VERSION} on both registries"
 
-      # Read back, for the same reason the index is read back: this job's
-      # success has to mean the pointer actually moved.
+      # Read back on both registries: success has to mean the pointer moved.
       - name: Verify latest resolves to the released digest
         env:
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
@@ -1421,33 +1508,26 @@ jobs:
           DIGEST: ${{ needs.publish_image.outputs.digest }}
         run: |
           set -euo pipefail
-          # Both registries. Checking only one would let the other sit on the
-          # previous release indefinitely, which is precisely the inconsistency
-          # this job exists to close.
           for img in "$GHCR_IMAGE" "$HUB_IMAGE"; do
-            # The digest, not ${img}:${VERSION}: the Docker Hub version tag is
-            # created last, by commit_tag, so it does not exist yet.
-            v="$DIGEST"
             l=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${img}:latest")
-            if [ "$v" != "$l" ]; then
-              echo "::error::${img}:latest resolves to ${l}, expected ${v} (${VERSION})"
+            if [ "$DIGEST" != "$l" ]; then
+              echo "::error::${img}:latest resolves to ${l}, expected ${DIGEST} (${VERSION})"
               exit 1
             fi
             echo "${img}:latest -> ${l}"
           done
 
-  # The Docker Hub page, after the scan so it carries it. A top-level job, not a
-  # call to another workflow: a called workflow's job never received its
-  # environment's secrets — release #6 and the 0.1.1 rollback both read the
-  # account password as empty — while top-level jobs always have. The page is
-  # written by a script in this repository, so the account password reaches
-  # reviewed code and no third-party action.
+  # The Docker Hub page: the page source with this release's scan, composed here
+  # from the same scan.md the release notes carry. A top-level job, not a call to
+  # another workflow: a called workflow's job never received its environment's
+  # secrets. The account password reaches a script in this repository and no
+  # third-party action.
   dockerhub_description:
     name: "Refresh the Docker Hub page"
-    needs: [resolve, release_approval, promote_latest, post_release_report]
+    needs: [resolve, release_approval, promote_latest, scan_published]
     if: |
       always() && needs.promote_latest.result == 'success' &&
-      needs.post_release_report.result == 'success'
+      needs.scan_published.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: dockerhub-metadata
@@ -1460,106 +1540,49 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      # The page exactly as the release composed it, scan included.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: scan-pages
+          name: scan
+      - name: Compose the page
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp docs/dockerhub_description.md page.md
+          ./scripts/apply_scan.sh scan.md page.md
+          grep -qF ":${VERSION}\`," page.md \
+            || { echo "::error::the composed page does not name ${VERSION}"; exit 1; }
       - name: Publish the page and read it back
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
           HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
           VCS_URL: https://github.com/${{ github.repository }}
-        run: ./scripts/dockerhub_page.sh "$HUB_REPO" docs/dockerhub_description.md
+        run: ./scripts/dockerhub_page.sh "$HUB_REPO" page.md
 
-  # Scan what was actually published, not what was built. The image on the
-  # registry is the one people pull, and advisories land after a release as
-  # often as before one.
-  post_release_report:
-    name: "Post-release vulnerability report"
-    needs: [resolve, release_approval, promote_latest]
-    if: always() && needs.promote_latest.result == 'success'
+  # One issue per CVE, not one issue listing them all: a lumped issue is never
+  # closed cleanly and stops being read. Matches how docker-nginx-lego tracks
+  # them. Separate from the scan, so the job running a third-party scanner holds
+  # no write access to issues, and after latest, so the list describes a release
+  # users can already pull.
+  record_cves:
+    name: "Open or update an issue per CVE"
+    needs: [resolve, release_approval, promote_latest, scan_published]
+    if: |
+      always() && needs.promote_latest.result == 'success' &&
+      needs.scan_published.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
-      # Read only. This job runs a third-party scanner over a published image
-      # and renders attacker-influenceable strings — package names and CVE text
-      # out of somebody else's advisory database — into markdown. It must not
-      # also be holding a token that can write to the repository. The commit is
-      # done by record_scan, which runs no scanner and touches none of that.
       contents: read
-      security-events: write
       issues: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          persist-credentials: false
-
-      - name: Scan the released image
-        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
-        with:
-          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-          severity: CRITICAL,HIGH
-          trivyignores: .trivyignore
-          format: sarif
-          output: trivy-released.sarif
-          exit-code: 0
-
-      - name: Upload scan results
-        if: always()
-        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
-        with:
-          sarif_file: trivy-released.sarif
-          category: trivy-released
-
-      # Every severity, not only the blocking ones. This report is what the
-      # README and the Docker Hub page show, and a table that quietly omitted
-      # MEDIUM would be a more misleading number than no table at all. The issue
-      # step below still filters to CRITICAL and HIGH itself.
-      - name: Scan again as JSON, all severities
-        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
-        with:
-          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
-          trivyignores: .trivyignore
-          format: json
-          output: trivy-released.json
-          exit-code: 0
-
-      # Docker Hub scans one repository per account, so the scan its page would
-      # otherwise have shown is information this project loses. Rendered from our
-      # own scan of the image that was actually published — not of the source
-      # tree, and not of the image that was built — and written onto both pages
-      # from one source, so the two can never disagree.
-      - name: Render the scan onto both pages
-        env:
-          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -euo pipefail
-          ./scripts/render_scan.sh trivy-released.json \
-            "${HUB_IMAGE}:${VERSION}" "$(date -u +%Y-%m-%d)" > scan.md
-          ./scripts/apply_scan.sh scan.md README.md docs/dockerhub_description.md
-          cat scan.md >> "$GITHUB_STEP_SUMMARY"
-
-      # Handed to the Docker Hub job as an artifact rather than read from the
-      # branch: that job checks out the commit this run started from, which
-      # cannot contain the commit made below.
-      - name: Hand the rendered pages on
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: scan-pages
-          path: |
-            README.md
-            docs/dockerhub_description.md
-          if-no-files-found: error
-
-      # One issue per CVE, not one issue listing them all: a lumped issue is
-      # never closed cleanly and stops being read. Matches how
-      # docker-nginx-lego tracks them.
+          name: scan
       - name: Open or update an issue per CVE
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1582,10 +1605,7 @@ jobs:
           fi
 
           # Fatal, like every other write before the Docker Hub tag is committed:
-          # the issues are part of the CVE list this release publishes. A failed
-          # listing used to read as "no open issues" and open duplicates of all
-          # of them; a failed create or comment used to be ignored because the
-          # loop ran in a pipe's subshell with nothing checking it.
+          # the issues are part of the CVE list this release publishes.
           open_issues=$(gh issue list --repo "$REPO" --label security --state open \
             --json number,title --limit 100) \
             || { echo "::error::cannot list the open security issues"; exit 1; }
@@ -1624,89 +1644,30 @@ jobs:
           done < <(printf '%s\n' "$cves")
           exit "$failed"
 
-
-  # Separated from the job above on purpose. `contents: write` is the permission
-  # that can change what this repository says, and it is deliberately not held by
-  # anything that runs a scanner, pulls an image, or renders third-party data.
-  # This job downloads two files and commits them; that is its whole surface.
-  record_scan:
-    name: "Record the scan on the default branch"
-    needs: [resolve, post_release_report]
-    if: always() && needs.post_release_report.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
-        with:
-          egress-policy: audit
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: scan-pages
-
-      # Fatal. This used to run after a finished release, where a warning was
-      # the right signal. It now runs before the Docker Hub version tag is
-      # committed, and the scan is part of what that tag is bound to: if the
-      # README cannot show it, the tag must not be created, and the rollback
-      # takes back the rest.
-      - name: Commit the scan onto the default branch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -uo pipefail
-          for f in README.md docs/dockerhub_description.md; do
-            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}") \
-              || { echo "::error::cannot read ${f} on ${BRANCH}"; exit 1; }
-            sha=$(printf '%s' "$meta" | jq -r '.sha')
-            # Identical content would mean an empty commit, which the API
-            # rejects — and a release that changed nothing on the page is a
-            # normal outcome, not a failure.
-            remote=$(printf '%s' "$meta" | jq -r '.content' | base64 -d | sha256sum | cut -d' ' -f1)
-            local_sum=$(sha256sum < "$f" | cut -d' ' -f1)
-            if [ "$remote" = "$local_sum" ]; then
-              echo "${f} already current on ${BRANCH}"
-              continue
-            fi
-            if gh api -X PUT "repos/${REPO}/contents/${f}" \
-                 -f message="Record the ${VERSION} vulnerability scan" \
-                 -f content="$(base64 < "$f" | tr -d '\n')" \
-                 -f sha="$sha" -f branch="$BRANCH" >/dev/null; then
-              echo "updated ${f} on ${BRANCH}"
-            else
-              echo "::error::could not update ${f} on ${BRANCH}"
-              exit 1
-            fi
-          done
-
   # THE COMMIT. The Docker Hub version tag, and nothing after it.
   #
   # Docker Hub version tags are immutable: once created, neither overwritable nor
   # deletable. So this is the one write that cannot be taken back, and it runs
-  # only after every other write of the release has succeeded — the image by
-  # digest, the OCI chart, the index, the GitHub release, latest, the scan, the
-  # pages. Until it succeeds everything is reversible, and `rollback` below
-  # reverses it; once it succeeds there is nothing left to fail. The tag and
-  # the release's metadata succeed together or not at all.
+  # only after every other write of the release has succeeded. Until it
+  # succeeds everything is reversible, and the rollback jobs below reverse it;
+  # once it succeeds there is nothing left to fail. The tag and the release's
+  # metadata succeed together or not at all.
   #
   # Content is already on Docker Hub by digest, so this writes one small index
   # manifest and nothing else.
   commit_tag:
     name: "Commit: create the Docker Hub version tag"
-    needs: [resolve, publish_image, publish_chart_oci, publish_chart_index, github_release, promote_latest, post_release_report, record_scan, dockerhub_description]
+    needs: [resolve, publish_image, publish_chart_oci, publish_chart_index, scan_published, github_release, promote_latest, dockerhub_description, record_cves]
     if: |
       always() &&
       needs.publish_image.result == 'success' &&
       needs.publish_chart_oci.result == 'success' &&
       needs.publish_chart_index.result == 'success' &&
+      needs.scan_published.result == 'success' &&
       needs.github_release.result == 'success' &&
       needs.promote_latest.result == 'success' &&
-      needs.post_release_report.result == 'success' &&
-      needs.record_scan.result == 'success' &&
-      needs.dockerhub_description.result == 'success'
+      needs.dockerhub_description.result == 'success' &&
+      needs.record_cves.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -1777,17 +1738,21 @@ jobs:
             echo "part of the release was published and verified before this tag existed."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ROLLBACK. Anything after the first push that fails before the commit is
-  # reverted by the same workflow that withdraws a finished release — started
-  # here as its own run rather than called, because a called workflow's jobs
-  # never received their environments' secrets, and the withdrawal needs them.
-  # That run deletes nothing until it is approved under release-approval.
+  # ── ROLLBACK ──────────────────────────────────────────────────────────────
+  # A release that fails after its first push and before the commit is undone
+  # here, in this same run, so what went wrong and what was undone are on one
+  # page. The steps are the same scripts the manual "Withdraw a release" uses,
+  # in the same order and under the same credentials, one kind per job.
   #
-  # actions: write is what starting a workflow takes, and it could start any of
-  # them; validate.sh allows it to this one job only, behind the approval, and
-  # the version it hands over is the one this run resolved.
-  rollback:
-    name: "Roll back the unfinished release"
+  # rollback_plan lists what exists. rollback_confirm is its own approval, under
+  # release-approval: approving a release is not approving its deletion, so
+  # nothing is removed until the reviewer has seen the list. Every undo job
+  # needs that approval, which validate.sh checks.
+  #
+  # always() lets these run when the release was cancelled as well as when it
+  # failed.
+  rollback_plan:
+    name: "↩ Rollback: what this release left behind"
     needs: [resolve, publish_image, commit_tag]
     if: |
       always() && needs.resolve.result == 'success' &&
@@ -1797,46 +1762,290 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: write
+      packages: read
+    outputs:
+      version: ${{ steps.p.outputs.version }}
+      hub_repo: ${{ steps.p.outputs.hub_repo }}
+      digest: ${{ steps.p.outputs.digest }}
+      prev: ${{ steps.p.outputs.prev }}
+      found: ${{ steps.p.outputs.found }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      - name: Start the withdrawal of this version
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Find what this release left behind
+        id: p
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+        run: ./scripts/withdraw/plan.sh
+
+  rollback_confirm:
+    name: "⚠️ Approve to ROLL BACK everything listed above"
+    needs: [rollback_plan]
+    if: always() && needs.rollback_plan.result == 'success' && needs.rollback_plan.outputs.found == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Record the decision
+        env:
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: echo "rollback of ${VERSION} approved"
+
+  rollback_pages:
+    name: "↩ 0. Roll back the gh-pages page sources"
+    needs: [rollback_plan, rollback_confirm]
+    if: always() && needs.rollback_confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore what this release changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -uo pipefail
-          printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
-            || { echo "::error::'${VERSION}' is not X.Y.Z"; exit 1; }
-          before=$(gh run list --repo "$REPO" --workflow withdraw_release.yaml --limit 1 \
-                     --json databaseId --jq '.[0].databaseId // 0')
-          if ! gh workflow run withdraw_release.yaml --repo "$REPO" --ref "$BRANCH" \
-                 -f version="$VERSION" -f confirm="$VERSION"; then
-            echo "::error::could not start the rollback. Start 'Withdraw a release' for ${VERSION} by hand — it is safe to run more than once."
-            exit 1
-          fi
-          id=""
-          for _ in $(seq 1 20); do
-            id=$(gh run list --repo "$REPO" --workflow withdraw_release.yaml --limit 1 \
-                   --json databaseId --jq '.[0].databaseId // 0')
-            [ "$id" != "$before" ] && break
-            sleep 3
-          done
-          url="https://github.com/${REPO}/actions/runs/${id}"
-          {
-            echo "## Rolling back ${VERSION}"
-            echo ""
-            echo "This release stopped before its Docker Hub version tag, so nothing"
-            echo "irreversible was published. The withdrawal is running as its own run:"
-            echo ""
-            echo "${url}"
-            echo ""
-            echo "It deletes nothing until you approve it under **release-approval**."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "rollback started: ${url}"
-          # This run still ends red: the release did not happen.
-          exit 1
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: ./scripts/withdraw/pages.sh
+
+  rollback_hub_page:
+    name: "↩ 0. Roll back the Docker Hub page"
+    needs: [rollback_plan, rollback_confirm, rollback_pages]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_pages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore the page to the live release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/withdraw/hub_page.sh
+
+  rollback_issues:
+    name: "↩ 0. Roll back the CVE issues"
+    needs: [rollback_plan, rollback_confirm, rollback_hub_page]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_hub_page.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Close or re-point the issues, delete the comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/issues.sh
+
+  rollback_latest:
+    name: "↩ 1. Move latest back"
+    needs: [rollback_plan, rollback_confirm, rollback_issues]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_issues.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Move latest back, or remove it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/latest.sh
+
+  rollback_records:
+    name: "↩ 2. Remove the release, tags and chart index entry"
+    needs: [rollback_plan, rollback_confirm, rollback_latest]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_latest.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the releases and tags, hand back Latest, remove the index entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/records.sh
+
+  rollback_packages:
+    name: "↩ 4. Remove the ghcr packages"
+    needs: [rollback_plan, rollback_confirm, rollback_records]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_records.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Delete the chart, then the image, on ghcr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: ./scripts/withdraw/packages.sh
+
+  # The release never creates this tag before the commit, so this normally
+  # finds nothing. It runs anyway: the rollback proves that, rather than
+  # assuming it.
+  rollback_image:
+    name: "↩ 5. Remove the Docker Hub version tag"
+    needs: [rollback_plan, rollback_confirm, rollback_packages]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_packages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      removed: ${{ steps.i.outputs.removed }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the tag, unless it is immutable
+        id: i
+        env:
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: ./scripts/withdraw/image.sh
+
+  rollback_attestations:
+    name: "↩ 6. Remove the attestation records"
+    needs: [rollback_plan, rollback_confirm, rollback_image]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_image.result == 'success' && needs.rollback_image.outputs.removed == 'true' && needs.rollback_plan.outputs.digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the attestations for the digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+        run: ./scripts/withdraw/attestations.sh
+
+  # The run stays red either way: the release did not happen. This job's own
+  # result says whether the rollback left anything behind.
+  rollback_verify:
+    name: "↩ Verify: nothing of this release is left"
+    needs: [rollback_plan, rollback_confirm, rollback_pages, rollback_hub_page, rollback_issues, rollback_latest, rollback_records, rollback_packages, rollback_image, rollback_attestations]
+    if: always() && needs.rollback_confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      packages: read
+      attestations: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check every location
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+          HUB_KEPT: ${{ needs.rollback_image.outputs.removed == 'false' }}
+          STEPS: >-
+            pages ${{ needs.rollback_pages.result }}, Docker Hub page ${{ needs.rollback_hub_page.result }},
+            issues ${{ needs.rollback_issues.result }}, latest ${{ needs.rollback_latest.result }},
+            records ${{ needs.rollback_records.result }}, ghcr ${{ needs.rollback_packages.result }},
+            Docker Hub tag ${{ needs.rollback_image.result }}, attestations ${{ needs.rollback_attestations.result }}
+        run: ./scripts/withdraw/verify.sh

@@ -1,56 +1,55 @@
-# Take a published release back — every trace of it that reached the outside.
+# Take a published release back: every trace of it that reached the outside.
 #
-# The release workflow cleans up only the narrow case it can recognise: a run
-# that started pushing and then failed. Everything else — a release that
-# finished and then turned out to be wrong, an image withdrawn days later — has
-# no path back except doing it by hand across a dozen places and missing one.
+# A release that fails before its Docker Hub version tag rolls itself back, in
+# its own run, with the same steps as this workflow: scripts/withdraw/. This
+# workflow is for everything else, such as a finished release that turned out to
+# be wrong, or a rollback that has to be finished by hand.
 #
-# WHAT A RELEASE WRITES, AND WHERE IT IS UNDONE
+# WHAT A RELEASE WRITES, AND WHICH STEP UNDOES IT
 #
-#   pages     scan on README.md and on the Docker Hub page   withdraw_pages, withdraw_hub_page
-#             gh-pages index.html / robots.txt / sitemap.xml  withdraw_pages
-#   CVE list  [SECURITY] issues and their comments            withdraw_issues
-#   latest    on Docker Hub and on ghcr                       withdraw_latest  (moved back, not deleted)
-#   records   GitHub releases, git tags, "Latest" marker      withdraw_records
-#             chart repository index and .tgz on gh-pages     withdraw_records
-#   packages  OCI chart and image on ghcr, with every child   withdraw_packages
+#   pages     the Docker Hub page (with the scan)             hub_page.sh
+#             gh-pages index.html / robots.txt / sitemap.xml  pages.sh
+#   CVE list  [SECURITY] issues and their comments            issues.sh
+#   latest    on Docker Hub and on ghcr                       latest.sh    (moved back, not deleted)
+#   records   GitHub releases (the scan is in the notes),     records.sh
+#             git tags, the "Latest" marker, the chart
+#             repository index and .tgz on gh-pages
+#   packages  OCI chart and image on ghcr, with every child   packages.sh
 #             manifest and the provenance referrer
-#   image     version tag on Docker Hub                       withdraw_image
-#   proof     GitHub attestation records for the digest       withdraw_attestations
+#   image     version tag on Docker Hub                       image.sh
+#   proof     GitHub attestation records for the digest       attestations.sh
 #
-# Three things cannot be undone by anyone, and this workflow does not pretend to:
-# the Sigstore transparency-log entry (append-only by design); the gh-pages git
-# history, which would take a force-push rewrite of the published branch; and a
-# Docker Hub version tag covered by a tag-immutability rule, which Docker Hub
-# protects from deletion as well as overwrite. A finished release has such a
-# tag; a release rolled back part-way never does, because the release creates
-# its version tag last.
+# Nobody can undo three things, and this workflow does not pretend to: the
+# Sigstore transparency-log entry (append-only by design), the gh-pages git
+# history (that would take a force-push of the published branch), and a Docker
+# Hub version tag covered by a tag-immutability rule. A finished release has
+# such a tag. A release rolled back part-way never does, because the release
+# creates its version tag last.
 #
-# ORDER is the exact reverse of publication, so at every instant whatever is
-# still advertised is still resolvable:
+# ORDER is the exact reverse of publication, so whatever is still advertised is
+# always still resolvable:
 #
 #   publish    image → OCI chart → index → releases → latest → pages, CVE list
 #   withdraw   pages, CVE list → latest → releases → index → OCI chart → image
 #
-# ALL OR NOTHING. There are no per-artefact switches. A partial withdrawal is the
-# out-of-sync state this workflow exists to prevent; each step runs only if the
-# one before it succeeded, so a failure stops the unwind with the remaining
-# artefacts still consistent with each other.
+# ALL OR NOTHING. There are no per-artefact switches: each step runs only if the
+# one before it succeeded, so a failure stops the unwind with what remains still
+# consistent with itself. Every step skips what is already gone, so a re-run
+# finishes the job.
 #
-# CREDENTIALS — one kind per job:
+# CREDENTIALS, one kind per job:
 #
 #   withdraw_pages         GITHUB_TOKEN          contents: write
-#   withdraw_hub_page      Docker Hub password   own environment, reusable workflow
+#   withdraw_hub_page      Docker Hub password   environment dockerhub-metadata
 #   withdraw_issues        GITHUB_TOKEN          issues: write
-#   withdraw_latest        Docker Hub token      packages: write (ghcr latest)
+#   withdraw_latest        Docker Hub token      environment release, packages: write
 #   withdraw_records       GITHUB_TOKEN          contents: write
-#   withdraw_packages      GITHUB_TOKEN          packages: write (this repository's packages only)
-#   withdraw_image         Docker Hub token      contents: read
+#   withdraw_packages      GITHUB_TOKEN          packages: write
+#   withdraw_image         Docker Hub token      environment release
 #   withdraw_attestations  GITHUB_TOKEN          attestations: write
 #
-# No personal token is involved. ghcr versions are deleted with the run's own
-# GITHUB_TOKEN, which the admin role GitHub gives the publishing repository
-# allows — scoped to this repository's packages and to one run.
+# No personal token is involved. Nothing here is a called workflow: a called
+# workflow's jobs never received their environments' secrets.
 name: Withdraw a release
 
 on:
@@ -64,13 +63,10 @@ on:
         description: "Type the same version again to confirm. Everything this version published is removed."
         required: true
         type: string
-  # Also the release's rollback: a release that fails before its Docker Hub
-  # version tag is committed starts this as its own run. Not a call — a called
-  # workflow's jobs never received their environments' secrets. The approval
-  # below applies either way.
 
 # Its own group, not the release group: a withdrawal must not queue behind a
-# release, and a release must not be cancelled by a withdrawal.
+# release, and a release must not be cancelled by a withdrawal. Both are safe
+# side by side, because every step skips what is already gone.
 concurrency:
   group: withdraw
   cancel-in-progress: false
@@ -79,9 +75,8 @@ permissions:
   contents: read
 
 jobs:
-  # Ungated, and it runs first. The reviewer facing the approval is told exactly
-  # what exists and what will happen to it, rather than being asked to approve a
-  # version number.
+  # Not gated, and it runs first. The person approving is shown exactly what
+  # exists and what will happen to it, not asked to approve a version number.
   plan:
     name: "What will be withdrawn"
     runs-on: ubuntu-latest
@@ -100,176 +95,37 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      # The live branch, not the triggering commit: as the release's rollback,
-      # the triggering commit predates the scan this same run committed.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Resolve and confirm
-        id: p
+      # Typing it twice is the only protection against withdrawing the wrong
+      # version, and nothing after the approval can be taken back.
+      - name: Confirm the version
+        id: c
         env:
           VERSION: ${{ inputs.version }}
           CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -uo pipefail
+          version=$(printf '%s' "$VERSION" | tr -d '[:space:]'); version="${version#v}"
+          confirm=$(printf '%s' "$CONFIRM" | tr -d '[:space:]'); confirm="${confirm#v}"
+          if [ -z "$version" ] || [ "$version" != "$confirm" ]; then
+            echo "::error::confirmation does not match: got '${confirm}', expected '${version}'"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Find what this version left behind
+        id: p
+        env:
+          VERSION: ${{ steps.c.outputs.version }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           ACTOR: ${{ github.actor }}
-        run: |
-          set -uo pipefail
-          version=$(printf '%s' "$VERSION" | tr -d '[:space:]')
-          confirm=$(printf '%s' "$CONFIRM" | tr -d '[:space:]')
-          version="${version#v}"
-          confirm="${confirm#v}"
-          # Typing it twice is the only protection against withdrawing the wrong
-          # version, and nothing below can be taken back.
-          if [ "$version" != "$confirm" ]; then
-            echo "::error::confirmation does not match: got '${confirm}', expected '${version}'"
-            exit 1
-          fi
-          [ -n "$version" ] || { echo "::error::no version given"; exit 1; }
-          # Constrained before it reaches a URL, a grep or a shell word below.
-          printf '%s' "$version" | grep -qE '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$' \
-            || { echo "::error::'${version}' is not a plain version string"; exit 1; }
-          if [ -z "${HUB_REPO:-}" ]; then
-            echo "::error::repository variable DOCKERHUB_REPOSITORY is not set"
-            exit 1
-          fi
-          ghcr="ghcr.io/${REPO,,}"
-
-          # The index digest: what `latest`, the child manifests and the
-          # attestation records are all keyed on. Docker Hub first, anonymously;
-          # ghcr if Docker Hub no longer has the tag (a re-run after a partial
-          # withdrawal).
-          digest=$(docker buildx imagetools inspect "docker.io/${HUB_REPO}:${version}" \
-                     --format '{{.Manifest.Digest}}' 2>/dev/null || true)
-          if [ -z "$digest" ]; then
-            printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null 2>&1 || true
-            digest=$(docker buildx imagetools inspect "${ghcr}:${version}" \
-                       --format '{{.Manifest.Digest}}' 2>/dev/null || true)
-          fi
-
-          # The release `latest` goes back to: the highest remaining published
-          # version. Drafts, pre-releases and chart-releaser's own releases are
-          # not candidates.
-          prev=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases \
-                   --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null \
-                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF "v${version}" \
-                 | sed 's/^v//' | sort -V | tail -1)
-
-          found=0
-          {
-            echo "## Withdrawing \`${version}\`"
-            echo ""
-            echo "Undone in this order — the reverse of how it was published, so"
-            echo "nothing is ever advertised after the thing it points at is gone."
-            echo ""
-            echo "| # | What | Now | Action |"
-            echo "|---|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
-          row() { printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4" >> "$GITHUB_STEP_SUMMARY"; }
-
-          # 0 — pages and the CVE list: published last, undone first.
-          for f in README.md docs/dockerhub_description.md; do
-            if awk '/scan:begin/{b=1;next}/scan:end/{b=0}b' "$f" | grep -qF ":${version}\`,"; then
-              row 0 "scan on \`${f}\`" "shows ${version}" "**roll back** to the previous release's scan"; found=1
-            else
-              row 0 "scan on \`${f}\`" "does not show ${version}" "nothing to do"
-            fi
-          done
-          row 0 "Docker Hub page" "mirrors docs/dockerhub_description.md" "**refresh** from the rolled-back file"
-          row 0 "gh-pages page sources" "—" "**restore** anything ${version} changed that nothing since has"
-          opened=$(gh issue list --repo "$REPO" --label security --state open --limit 200 \
-                     --json body --jq "[.[] | select(.body | contains(\"**Detected in release:** \`v${version}\`\"))] | length" 2>/dev/null || echo "?")
-          row 0 "CVE issues opened by v${version}" "${opened} open" "**close**, or re-point to the live release if still present there"
-          [ "$opened" != "0" ] && [ "$opened" != "?" ] && found=1
-          row 0 "\"Still present in release v${version}\" comments" "—" "**delete**"
-
-          # 1 — latest.
-          if [ -n "$digest" ]; then
-            hub_latest=$(docker buildx imagetools inspect "docker.io/${HUB_REPO}:latest" \
-                           --format '{{.Manifest.Digest}}' 2>/dev/null || true)
-            if [ "$hub_latest" = "$digest" ]; then
-              if [ -n "$prev" ]; then
-                row 1 "\`latest\` (Docker Hub, ghcr)" "points at ${version}" "**move back** to ${prev}"
-              else
-                row 1 "\`latest\` (Docker Hub, ghcr)" "points at ${version}" "**delete** — no earlier release to move back to"
-              fi
-              found=1
-            else
-              row 1 "\`latest\`" "points elsewhere" "left alone"
-            fi
-          else
-            row 1 "\`latest\`" "image not found" "nothing to do"
-          fi
-
-          # 2 — releases, tags, the Latest marker.
-          for name in "v${version}" "cert-manager-webhook-freemyip-${version}"; do
-            if gh release view "$name" --repo "$REPO" >/dev/null 2>&1; then
-              row 2 "release \`${name}\`" "published" "**delete**, with its git tag"; found=1
-            else
-              row 2 "release \`${name}\`" "absent" "nothing to do"
-            fi
-          done
-          row 2 "\"Latest release\" marker" "—" "**moves to** ${prev:-nothing, no earlier release}"
-
-          # 3 — the chart repository index.
-          if idx=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null) \
-             && printf '%s' "$idx" | base64 -d | grep -q "version: ${version}\$"; then
-            row 3 "Helm index entry and .tgz" "advertised" "**remove**"; found=1
-          else
-            row 3 "Helm index entry" "not advertised" "nothing to do"
-          fi
-
-          # 4, 5, 6 — the artefacts themselves, and the proof of them.
-          if [ -n "$digest" ]; then
-            row 4 "ghcr chart and image" "digest \`${digest}\`" "**delete**, with every child manifest and the provenance referrer"
-            hub_code=$(curl -s -o /dev/null -w '%{http_code}' \
-              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/")
-            immutable=""
-            if [ "$hub_code" = "200" ]; then
-              immutable=$(curl -s "https://hub.docker.com/v2/repositories/${HUB_REPO}/" \
-                | jq -r --arg v "$version" '.immutable_tags_settings | select(.enabled == true) | .rules[]? as $r | select($v | test($r)) | $r' \
-                | head -1)
-            fi
-            if [ "$hub_code" != "200" ]; then
-              row 5 "Docker Hub \`${version}\`" "no version tag" "nothing to do"
-              row 6 "attestation records" "for \`${digest}\`" "**delete**"
-            elif [ -n "$immutable" ]; then
-              row 5 "Docker Hub \`${version}\`" "immutable (rule \`${immutable}\`)" "**stays** — Docker Hub allows no one to delete it"
-              row 6 "attestation records" "for \`${digest}\`" "kept, because the image is still served"
-            else
-              row 5 "Docker Hub \`${version}\`" "published" "**delete**"
-              row 6 "attestation records" "for \`${digest}\`" "**delete**"
-            fi
-            found=1
-          else
-            row 4 "ghcr / Docker Hub images" "not found on either registry" "nothing to do"
-          fi
-
-          {
-            echo ""
-            echo "Not reversible by anyone: the Sigstore transparency-log entry, and"
-            echo "the gh-pages git history."
-            echo ""
-            if [ "$found" = "1" ]; then
-              echo "**The next approval undoes everything marked above. It publishes nothing.**"
-              echo ""
-              echo "Review deployments → release-approval → Approve and deploy, to proceed."
-            else
-              echo "Nothing from ${version} is published. There is nothing to withdraw."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          {
-            echo "version=${version}"
-            echo "hub_repo=${HUB_REPO}"
-            echo "digest=${digest}"
-            echo "prev=${prev}"
-            echo "found=${found}"
-          } >> "$GITHUB_OUTPUT"
+        run: ./scripts/withdraw/plan.sh
 
   # The approval, in the environment that carries the reviewer. It holds no
   # secrets and deletes nothing: the job that asks is not the job that acts.
@@ -291,151 +147,35 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: echo "withdrawal of ${VERSION} approved"
 
-  # ── 0. the pages that describe the release ─────────────────────────────────
-  # The scan on both READMEs, and the page sources on gh-pages, were the last
-  # things the release wrote, so they are the first things undone. Each is put
-  # back exactly as it was before this version's own commit — and left alone if
-  # a later release has changed it since, so withdrawing an old version never
-  # rolls a page back past a release that is still live.
-  #
-  # contents: write and nothing else. No registry credential, no scanner.
+  # ── 0. what describes the release ─────────────────────────────────────────
   withdraw_pages:
-    name: "0. Roll back the pages"
+    name: "0. Roll back the gh-pages page sources"
     needs: [plan, confirm]
     if: always() && needs.confirm.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
-    outputs:
-      hub_changed: ${{ steps.changed.outputs.hub }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      # Full history: the rollback finds this version's "Record the <version>
-      # vulnerability scan" commit and restores the block from its parent.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Roll back the scan on both READMEs
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: ./scripts/rollback_scan.sh "$VERSION" README.md docs/dockerhub_description.md
-
-      # The Docker Hub page is only rewritten when its source actually changed.
-      # A release that failed before recording its scan never touched it, and
-      # the 0.1.1 rollback showed what an unneeded page write costs: it failed
-      # and held back every deletion behind it.
-      - name: Did the Docker Hub page change?
-        id: changed
-        run: |
-          if git diff --quiet HEAD -- docs/dockerhub_description.md; then
-            echo "hub=false" >> "$GITHUB_OUTPUT"; echo "Docker Hub page unchanged"
-          else
-            echo "hub=true" >> "$GITHUB_OUTPUT"; echo "Docker Hub page changed"
-          fi
-
-      # The Docker Hub job and the issue job both work from exactly this file,
-      # so the Hub page, the README and the CVE issues cannot end up describing
-      # different releases.
-      - name: Hand the rolled-back pages on
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: scan-pages-restored
-          path: |
-            README.md
-            docs/dockerhub_description.md
-          if-no-files-found: error
-
-      # Fatal, unlike the release's own scan commit: a withdrawal that leaves the
-      # README describing a version that no longer exists is not finished.
-      - name: Commit the rolled-back pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          for f in README.md docs/dockerhub_description.md; do
-            meta=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}") \
-              || { echo "::error::cannot read ${f} on ${BRANCH}"; exit 1; }
-            sha=$(printf '%s' "$meta" | jq -r '.sha')
-            remote=$(printf '%s' "$meta" | jq -r '.content' | base64 -d | sha256sum | cut -d' ' -f1)
-            if [ "$remote" = "$(sha256sum < "$f" | cut -d' ' -f1)" ]; then
-              echo "${f} already current on ${BRANCH}"
-              continue
-            fi
-            gh api -X PUT "repos/${REPO}/contents/${f}" \
-              -f message="Withdraw the ${VERSION} vulnerability scan" \
-              -f content="$(base64 < "$f" | tr -d '\n')" \
-              -f sha="$sha" -f branch="$BRANCH" >/dev/null \
-              || { echo "::error::could not update ${f} on ${BRANCH}"; exit 1; }
-            echo "rolled back ${f} on ${BRANCH}"
-          done
-
-          # Read back: the branch, not the local copy, is what people see.
-          for f in README.md docs/dockerhub_description.md; do
-            if gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}" --jq '.content' | base64 -d \
-               | awk '/scan:begin/{b=1;next}/scan:end/{b=0}b' | grep -qF ":${VERSION}\`,"; then
-              echo "::error::${f} on ${BRANCH} still shows ${VERSION}"
-              exit 1
-            fi
-          done
-
-      # The release writes page sources with "Add|Update <name> for <version>".
-      # Each is restored to its content before that commit — or removed, if the
-      # release added it — but only while it still holds exactly what that
-      # release wrote. A later release's page is never touched.
-      - name: Roll back the gh-pages page sources
+      - name: Restore what this version changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          git fetch --quiet origin gh-pages || { echo "no gh-pages branch — nothing to roll back"; exit 0; }
-          for name in index.html robots.txt sitemap.xml; do
-            c=$(git log origin/gh-pages -F --grep="${name} for ${VERSION}" --format=%H -- "$name" | head -1)
-            if [ -z "$c" ]; then
-              echo "${name}: not changed by ${VERSION}"
-              continue
-            fi
-            cur=$(git rev-parse -q --verify "origin/gh-pages:${name}" || echo "")
-            if [ "$cur" != "$(git rev-parse "${c}:${name}")" ]; then
-              echo "${name}: changed again after ${VERSION} — left as it is"
-              continue
-            fi
-            sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha') \
-              || { echo "::error::cannot read ${name} on gh-pages"; exit 1; }
-            if git cat-file -e "${c}^:${name}" 2>/dev/null; then
-              git show "${c}^:${name}" > "/tmp/prev-${name}"
-              gh api -X PUT "repos/${REPO}/contents/${name}" \
-                -f message="Withdraw ${name} changes from ${VERSION}" \
-                -f content="$(base64 < "/tmp/prev-${name}" | tr -d '\n')" \
-                -f sha="$sha" -f branch=gh-pages >/dev/null \
-                || { echo "::error::could not restore ${name}"; exit 1; }
-              echo "${name}: restored to its content before ${VERSION}"
-            else
-              gh api -X DELETE "repos/${REPO}/contents/${name}" \
-                -f message="Withdraw ${name}, added by ${VERSION}" \
-                -f sha="$sha" -f branch=gh-pages >/dev/null \
-                || { echo "::error::could not remove ${name}"; exit 1; }
-              echo "${name}: removed, it was added by ${VERSION}"
-            fi
-          done
+        run: ./scripts/withdraw/pages.sh
 
-  # Written by the same script a release uses, from a top-level job so its
-  # environment's secrets arrive, and read back byte for byte. Only when the
-  # page's source actually changed.
+  # A top-level job, so its environment's secret arrives. The account password
+  # reaches a script in this repository and nothing else.
   withdraw_hub_page:
     name: "0. Roll back the Docker Hub page"
-    needs: [plan, withdraw_pages]
-    if: always() && needs.withdraw_pages.result == 'success' && needs.withdraw_pages.outputs.hub_changed == 'true'
+    needs: [plan, confirm, withdraw_pages]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_pages.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: dockerhub-metadata
@@ -447,32 +187,23 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: scan-pages-restored
-      - name: Publish the page and read it back
+      - name: Restore the page to the live release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
-          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           VCS_URL: https://github.com/${{ github.repository }}
-        run: ./scripts/dockerhub_page.sh "$HUB_REPO" docs/dockerhub_description.md
+        run: ./scripts/withdraw/hub_page.sh
 
-  # ── 0. the CVE list as issues ──────────────────────────────────────────────
-  # The release opens one [SECURITY] issue per finding and comments on existing
-  # ones. Both are statements about the withdrawn image. Issues it opened are
-  # closed — unless the finding is also in the release now live, in which case
-  # the issue is still true and is re-pointed at that release instead. Its
-  # "still present" comments are deleted outright.
-  #
-  # "Live" is read from the rolled-back README, so the issues and the page agree
-  # by construction.
   withdraw_issues:
     name: "0. Roll back the CVE issues"
-    needs: [plan, withdraw_pages]
-    if: always() && needs.withdraw_pages.result == 'success'
+    needs: [plan, confirm, withdraw_hub_page]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_hub_page.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -482,75 +213,22 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          name: scan-pages-restored
-
+          persist-credentials: false
       - name: Close or re-point the issues, delete the comments
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
           PREV: ${{ needs.plan.outputs.prev }}
-        run: |
-          set -uo pipefail
-          live=$(awk '/scan:begin/{b=1;next}/scan:end/{b=0}b' README.md \
-                   | grep -oE '(CVE|GHSA|GO)-[0-9A-Za-z-]+' | sort -u || true)
-          marker="**Detected in release:** \`v${VERSION}\`"
-          failed=0
+        run: ./scripts/withdraw/issues.sh
 
-          issues=$(gh issue list --repo "$REPO" --label security --state open --limit 200 \
-                     --json number,title,body) || { echo "::error::cannot list issues"; exit 1; }
-          while IFS= read -r n; do
-            [ -n "$n" ] || continue
-            title=$(printf '%s' "$issues" | jq -r --argjson n "$n" '.[] | select(.number == $n) | .title')
-            cve=$(printf '%s' "$title" | grep -oE '(CVE|GHSA|GO)-[0-9A-Za-z-]+' | head -1)
-            if [ -n "$cve" ] && [ -n "$PREV" ] && printf '%s\n' "$live" | grep -qxF "$cve"; then
-              body=$(printf '%s' "$issues" | jq -r --argjson n "$n" '.[] | select(.number == $n) | .body')
-              body=${body//"$marker"/"**Detected in release:** \`v${PREV}\`"}
-              if gh issue edit "$n" --repo "$REPO" --body "$body" >/dev/null \
-                 && gh issue comment "$n" --repo "$REPO" \
-                      --body "Release \`v${VERSION}\` was withdrawn. This finding is also present in \`v${PREV}\`, which is live again, so the issue stays open." >/dev/null; then
-                echo "#${n} ${cve}: re-pointed at v${PREV}"
-              else
-                echo "::error::could not re-point #${n}"; failed=1
-              fi
-            else
-              if gh issue close "$n" --repo "$REPO" --reason "not planned" \
-                   --comment "Opened by release \`v${VERSION}\`, which has been withdrawn. The release now live does not contain this finding." >/dev/null; then
-                echo "#${n} ${cve}: closed"
-              else
-                echo "::error::could not close #${n}"; failed=1
-              fi
-            fi
-          done < <(printf '%s' "$issues" | jq -r --arg m "$marker" '.[] | select(.body | contains($m)) | .number')
-
-          # Comments the release added to issues that predate it.
-          while IFS= read -r id; do
-            [ -n "$id" ] || continue
-            if gh api -X DELETE "repos/${REPO}/issues/comments/${id}" >/dev/null 2>&1; then
-              echo "deleted comment ${id}"
-            else
-              echo "::error::could not delete comment ${id}"; failed=1
-            fi
-          done < <(gh api --paginate "repos/${REPO}/issues/comments?per_page=100" \
-                     --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | startswith(\"Still present in release \`v${VERSION}\`\")) | .id")
-
-          exit "$failed"
-
-  # ── 1. latest ──────────────────────────────────────────────────────────────
-  # Moved back, not deleted: withdrawing a bad release should leave users on the
-  # previous good one, exactly as if the bad one had never shipped. Only touched
-  # where it still points at this version's digest. With no earlier release it
-  # is removed; on ghcr it goes with the version's package entry in step 4.
+  # ── 1. latest ─────────────────────────────────────────────────────────────
   withdraw_latest:
     name: "1. Move latest back"
-    needs: [plan, confirm, withdraw_pages, withdraw_hub_page, withdraw_issues]
-    if: |
-      always() && needs.confirm.result == 'success' &&
-      needs.withdraw_pages.result == 'success' &&
-      (needs.withdraw_hub_page.result == 'success' || needs.withdraw_hub_page.result == 'skipped') &&
-      needs.withdraw_issues.result == 'success'
+    needs: [plan, confirm, withdraw_issues]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_issues.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -561,74 +239,23 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to both registries
-        env:
-          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
-          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
-          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
-          printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
       - name: Move latest back, or remove it
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
-          REPO: ${{ github.repository }}
           DIGEST: ${{ needs.plan.outputs.digest }}
           PREV: ${{ needs.plan.outputs.prev }}
-        run: |
-          set -uo pipefail
-          [ -n "$DIGEST" ] || { echo "no image for this version — latest cannot point at it"; exit 0; }
-          ghcr="ghcr.io/${REPO,,}"
-          hub="docker.io/${HUB_REPO}"
-          at() { docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>/dev/null || true; }
+        run: ./scripts/withdraw/latest.sh
 
-          # ghcr before Docker Hub, as on publication: ghcr tags are the
-          # overwritable ones.
-          for img in "$ghcr" "$hub"; do
-            if [ "$(at "${img}:latest")" != "$DIGEST" ]; then
-              echo "${img}:latest does not point at this version — left alone"
-              continue
-            fi
-            if [ -n "$PREV" ]; then
-              docker buildx imagetools create --tag "${img}:latest" "${img}:${PREV}" \
-                || { echo "::error::could not move ${img}:latest back to ${PREV}"; exit 1; }
-              want=$(at "${img}:${PREV}")
-              if [ -z "$want" ] || [ "$(at "${img}:latest")" != "$want" ]; then
-                echo "::error::${img}:latest does not resolve to ${PREV} after moving it"
-                exit 1
-              fi
-              echo "${img}:latest -> ${PREV} (${want})"
-            elif [ "$img" = "$hub" ]; then
-              user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
-              pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
-              jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
-                -H "Content-Type: application/json" \
-                -d "{\"username\":\"${user}\",\"password\":\"${pat}\"}" \
-                | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
-              [ -n "$jwt" ] || { echo "::error::could not authenticate to the Docker Hub API"; exit 1; }
-              code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-                "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/latest/" \
-                -H "Authorization: Bearer ${jwt}")
-              case "$code" in
-                20*|404) echo "${hub}:latest removed — no earlier release" ;;
-                *) echo "::error::deleting ${hub}:latest returned HTTP ${code}"; exit 1 ;;
-              esac
-            else
-              echo "${ghcr}:latest has no earlier release to move to — it goes with the version in step 4"
-            fi
-          done
-
-  # ── 2 and 3. the records ───────────────────────────────────────────────────
-  # The only job here that writes to the repository's releases and gh-pages, and
-  # it holds no registry credential of any kind.
+  # ── 2 and 3. the records ──────────────────────────────────────────────────
   withdraw_records:
     name: "2. Remove the releases, tags and chart index"
     needs: [plan, confirm, withdraw_latest]
@@ -641,98 +268,20 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - name: Delete the GitHub releases and their tags, and hand back the Latest marker
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the releases and tags, hand back Latest, remove the index entry
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
           PREV: ${{ needs.plan.outputs.prev }}
-        run: |
-          set -uo pipefail
-          # Exit status, not output: on an error gh prints the error body to stdout.
-          was_latest=$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null) || was_latest=""
-          # Both names: ours, and the one chart-releaser makes for itself.
-          for name in "v${VERSION}" "cert-manager-webhook-freemyip-${VERSION}"; do
-            if ! gh release view "$name" --repo "$REPO" >/dev/null 2>&1; then
-              echo "release ${name} not present"
-              continue
-            fi
-            gh release delete "$name" --repo "$REPO" --cleanup-tag --yes \
-              || { echo "::error::could not delete release ${name}"; exit 1; }
-            echo "deleted release ${name} and its tag"
-          done
-          # The marker was set explicitly by the release, so it is handed back
-          # explicitly rather than left to whatever GitHub picks.
-          if [ "$was_latest" = "v${VERSION}" ] && [ -n "$PREV" ]; then
-            gh release edit "v${PREV}" --repo "$REPO" --latest \
-              || { echo "::error::could not mark v${PREV} as the latest release"; exit 1; }
-            echo "v${PREV} is the latest release again"
-          fi
+        run: ./scripts/withdraw/records.sh
 
-      # Edited through the contents API rather than a push, because every
-      # checkout in this repository runs persist-credentials: false and a
-      # destructive job is the last place to start holding a pushable
-      # credential in a shell.
-      - name: Remove the version from the Helm repository index
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          command -v yq >/dev/null 2>&1 || { echo "::error::yq is not available on this runner"; exit 1; }
-          meta=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" 2>/dev/null) || {
-            echo "no index.yaml on gh-pages — nothing to remove"; exit 0; }
-          sha=$(printf '%s' "$meta" | jq -r '.sha')
-          printf '%s' "$meta" | jq -r '.content' | base64 -d > index.yaml
-
-          before=$(yq '.entries["cert-manager-webhook-freemyip"] | length' index.yaml)
-          V="$VERSION" yq -i \
-            'del(.entries["cert-manager-webhook-freemyip"][] | select(.version == strenv(V)))' index.yaml
-          after=$(yq '.entries["cert-manager-webhook-freemyip"] | length' index.yaml)
-          if [ "$before" != "$after" ]; then
-            gh api -X PUT "repos/${REPO}/contents/index.yaml" \
-              -f message="Withdraw ${VERSION} from the chart repository index" \
-              -f content="$(base64 < index.yaml | tr -d '\n')" \
-              -f sha="$sha" -f branch=gh-pages >/dev/null \
-              || { echo "::error::could not update index.yaml"; exit 1; }
-            echo "removed ${VERSION} from index.yaml (${before} -> ${after} entries)"
-          else
-            echo "index.yaml does not advertise ${VERSION}"
-          fi
-
-          tgz="cert-manager-webhook-freemyip-${VERSION}.tgz"
-          if tsha=$(gh api "repos/${REPO}/contents/${tgz}?ref=gh-pages" --jq '.sha' 2>/dev/null); then
-            gh api -X DELETE "repos/${REPO}/contents/${tgz}" \
-              -f message="Withdraw ${tgz}" -f sha="$tsha" -f branch=gh-pages >/dev/null \
-              || { echo "::error::could not delete ${tgz}"; exit 1; }
-            echo "deleted ${tgz} from gh-pages"
-          fi
-
-          # Read back: the step's success has to mean what its name says.
-          if gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null \
-             | base64 -d | grep -q "version: ${VERSION}\$"; then
-            echo "::error::index.yaml still advertises ${VERSION} after the update"
-            exit 1
-          fi
-
-  # ── 4. the ghcr packages ───────────────────────────────────────────────────
-  # Chart before image: the chart is what points at the image. Each is removed
-  # completely — the tagged index, every child manifest ghcr lists as its own
-  # version, and the provenance referrer — by the same script the release's
-  # failure cleanup uses.
-  #
-  # With the workflow's own token, not a personal one. GitHub gives the
-  # repository whose workflow published a package the admin role on it, and with
-  # admin a run's GITHUB_TOKEN can delete that package's versions. So this job
-  # can reach exactly this repository's two packages, for the length of one run
-  # — where a personal delete:packages token would reach every package on the
-  # account, for months. The ability is not new: it came with publishing them.
-  #
-  # It is still behind the approval — `confirm` is upstream, and validate.sh
-  # fails any job that asks for packages: write without release-approval above
-  # it, so no workflow can use this ability unapproved.
+  # ── 4. the ghcr packages ──────────────────────────────────────────────────
+  # packages: write on the run's own token. validate.sh fails any job asking
+  # for it without release-approval upstream.
   withdraw_packages:
     name: "4. Remove the ghcr packages"
     needs: [plan, confirm, withdraw_records]
@@ -750,36 +299,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
       - name: Delete the chart, then the image, on ghcr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           ACTOR: ${{ github.actor }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          # The script reads each index to find its children, which needs pull
-          # access to a package that may be private.
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
-          # A refusal here means the repository has lost its admin role on the
-          # package (Package settings → Manage Actions access). It fails before
-          # step 5, so Docker Hub is untouched and the registries still match.
-          if ! ./scripts/ghcr_delete_version.sh "${OWNER,,}" "charts%2Fcert-manager-webhook-freemyip" "$VERSION" \
-             || ! ./scripts/ghcr_delete_version.sh "${OWNER,,}" "cert-manager-webhook-freemyip" "$VERSION"; then
-            echo "::error::ghcr deletion failed. Check that ${GITHUB_REPOSITORY} has the Admin role under each package's Manage Actions access. Docker Hub was not touched."
-            exit 1
-          fi
+        run: ./scripts/withdraw/packages.sh
 
-  # ── 5. the Docker Hub version tag ──────────────────────────────────────────
-  # A version tag matched by a tag-immutability rule can be neither overwritten
-  # nor deleted — that is what the rule is for, and nobody, this workflow
-  # included, can take it back. So it is checked, not attempted: an immutable
-  # tag is reported as staying, and the attestation records that prove it are
-  # kept with it rather than stripped from an image still being served.
-  #
-  # When this workflow runs as the release's rollback the tag never exists —
-  # the release creates it last, only once everything else has succeeded.
+  # ── 5. the Docker Hub version tag ─────────────────────────────────────────
   withdraw_image:
     name: "5. Remove the Docker Hub version tag"
     needs: [plan, confirm, withdraw_packages]
@@ -790,88 +319,29 @@ jobs:
     permissions:
       contents: read
     outputs:
-      # true once no Docker Hub version tag names this image any more.
-      removed: ${{ steps.imm.outputs.removed || steps.del.outputs.removed }}
+      removed: ${{ steps.i.outputs.removed }}
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - name: Check whether the tag exists, and whether it is immutable
-        id: imm
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the tag, unless it is immutable
+        id: i
         env:
-          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 --max-time 30 \
-            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/")
-          case "$code" in
-            404) echo "${HUB_REPO}:${VERSION} does not exist — nothing to remove"
-                 echo "removed=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
-            200) ;;
-            *)   echo "::error::could not check ${HUB_REPO}:${VERSION} (HTTP ${code})"; exit 1 ;;
-          esac
-          settings=$(curl -sf --retry 3 --max-time 30 \
-            "https://hub.docker.com/v2/repositories/${HUB_REPO}/" | jq -c '.immutable_tags_settings // {}') \
-            || { echo "::error::could not read the immutability settings"; exit 1; }
-          if [ "$(printf '%s' "$settings" | jq -r '.enabled // false')" = "true" ]; then
-            # Docker Hub rules are RE2; the ones this project uses are plain
-            # anchored patterns that ERE reads identically.
-            while IFS= read -r rule; do
-              [ -n "$rule" ] || continue
-              if printf '%s' "$VERSION" | grep -qE -- "$rule"; then
-                echo "::warning::${HUB_REPO}:${VERSION} is immutable (rule ${rule}) and cannot be removed by anyone. Everything else from this release has been withdrawn; this tag, and its attestation records, stay."
-                {
-                  echo "### \`${HUB_REPO}:${VERSION}\` stays"
-                  echo ""
-                  echo "It is covered by the tag-immutability rule \`${rule}\`, which Docker Hub"
-                  echo "enforces against deletion as well as overwrite. \`latest\` no longer"
-                  echo "points at it, and nothing this project publishes refers to it any more."
-                } >> "$GITHUB_STEP_SUMMARY"
-                echo "removed=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            done < <(printf '%s' "$settings" | jq -r '.rules[]?')
-          fi
-          echo "${HUB_REPO}:${VERSION} exists and is not immutable — deleting"
-
-      - name: Delete the Docker Hub version tag
-        id: del
-        if: steps.imm.outputs.removed == ''
-        env:
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -uo pipefail
-          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
-          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
-          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"${user}\",\"password\":\"${pat}\"}" \
-            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
-          [ -n "$jwt" ] || { echo "::error::could not authenticate to the Docker Hub API"; exit 1; }
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" \
-            -H "Authorization: Bearer ${jwt}")
-          case "$code" in
-            20*|404) echo "delete ${HUB_REPO}:${VERSION} -> ${code}"
-                     echo "removed=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::deleting ${HUB_REPO}:${VERSION} returned HTTP ${code}"; exit 1 ;;
-          esac
+        run: ./scripts/withdraw/image.sh
 
-  # ── 6. the attestation records ─────────────────────────────────────────────
-  # Last: a provenance record for an image that no longer exists is harmless for
-  # the moment it takes to get here, while removing it first would leave a live
-  # image with its proof missing. The Sigstore transparency-log entry behind it is
-  # append-only and stays.
+  # ── 6. the attestation records ────────────────────────────────────────────
+  # Kept while an immutable tag still serves the image: stripping the proof from
+  # an image people can still pull would be worse than leaving both.
   withdraw_attestations:
     name: "6. Remove the attestation records"
     needs: [plan, confirm, withdraw_image]
-    # Kept while an immutable tag still serves the image: stripping the proof
-    # from an image people can still pull would be worse than leaving both.
     if: always() && needs.confirm.result == 'success' && needs.withdraw_image.result == 'success' && needs.withdraw_image.outputs.removed == 'true' && needs.plan.outputs.digest != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -882,34 +352,22 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Delete the attestations for the digest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           DIGEST: ${{ needs.plan.outputs.digest }}
-        run: |
-          set -uo pipefail
-          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
-            || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
-          if out=$(gh api -X DELETE "users/${OWNER}/attestations/digest/${DIGEST}" 2>&1); then
-            echo "attestation records for ${DIGEST} deleted"
-          else
-            case "$out" in
-              *"404"*) echo "no attestation records for ${DIGEST}" ;;
-              *) echo "::error::could not delete the attestation records for ${DIGEST}: ${out}"; exit 1 ;;
-            esac
-          fi
+        run: ./scripts/withdraw/attestations.sh
 
-  # The withdrawal proves itself. Every place the version could have been
-  # published is checked from outside, independently of the steps that removed
-  # it, and the run fails if anything is still there — or if the release now
-  # live was disturbed. A green run means withdrawn, not "the steps ran".
   verify:
     name: "Verify: nothing of this version is left"
     needs: [plan, confirm, withdraw_pages, withdraw_hub_page, withdraw_issues, withdraw_latest, withdraw_records, withdraw_packages, withdraw_image, withdraw_attestations]
     if: always() && needs.confirm.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       issues: read
@@ -919,101 +377,23 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Check every location
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
-          BRANCH: ${{ github.event.repository.default_branch }}
+          ACTOR: ${{ github.actor }}
           HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
           VERSION: ${{ needs.plan.outputs.version }}
           PREV: ${{ needs.plan.outputs.prev }}
           DIGEST: ${{ needs.plan.outputs.digest }}
           HUB_KEPT: ${{ needs.withdraw_image.outputs.removed == 'false' }}
-          R_PAGES: ${{ needs.withdraw_pages.result }}
-          R_HUBPAGE: ${{ needs.withdraw_hub_page.result }}
-          R_ISSUES: ${{ needs.withdraw_issues.result }}
-          R_LATEST: ${{ needs.withdraw_latest.result }}
-          R_RECORDS: ${{ needs.withdraw_records.result }}
-          R_PACKAGES: ${{ needs.withdraw_packages.result }}
-          R_IMAGE: ${{ needs.withdraw_image.result }}
-          R_ATTEST: ${{ needs.withdraw_attestations.result }}
-        run: |
-          set -uo pipefail
-          fails=0
-          row() { printf '| %s | %s | %s |\n' "$1" "$2" "$3" >> "$GITHUB_STEP_SUMMARY"; }
-          present() { if "$@" >/dev/null 2>&1; then echo present; else echo absent; fi; }
-          check() {  # label, observed, expected
-            if [ "$2" = "$3" ]; then row "$1" "$2" "ok"; else row "$1" "$2" "**FAIL** — expected ${3}"; fails=$((fails + 1)); fi
-          }
-          {
-            echo "## Withdrawal of \`${VERSION}\`: verified from outside"
-            echo ""
-            echo "Steps: pages ${R_PAGES}, Docker Hub page ${R_HUBPAGE}, issues ${R_ISSUES}, latest ${R_LATEST},"
-            echo "records ${R_RECORDS}, ghcr ${R_PACKAGES}, Docker Hub tag ${R_IMAGE}, attestations ${R_ATTEST}."
-            echo ""
-            echo "| Location | Observed | Result |"
-            echo "|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # Exit status, not output: on an error gh prints the error body to stdout.
-          if idx=$(gh api "repos/${REPO}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null); then
-            idx=$(printf '%s' "$idx" | base64 -d)
-          else
-            idx=""
-          fi
-          check "chart index advertises ${VERSION}" "$(printf '%s' "$idx" | grep -cE "^[[:space:]]+version: ${VERSION}$")" "0"
-          check ".tgz for ${VERSION} on gh-pages" "$(present gh api "repos/${REPO}/contents/cert-manager-webhook-freemyip-${VERSION}.tgz?ref=gh-pages")" "absent"
-          for name in "v${VERSION}" "cert-manager-webhook-freemyip-${VERSION}"; do
-            check "release ${name}" "$(present gh release view "$name" --repo "$REPO")" "absent"
-            check "git tag ${name}" "$(present gh api "repos/${REPO}/git/ref/tags/${name}")" "absent"
-          done
-          for f in README.md docs/dockerhub_description.md; do
-            shows=$(gh api "repos/${REPO}/contents/${f}?ref=${BRANCH}" --jq '.content' | base64 -d \
-                      | awk '/scan:begin/{b=1;next}/scan:end/{b=0}b' | grep -cF ":${VERSION}\`,")
-            check "scan on ${f} shows ${VERSION}" "$shows" "0"
-          done
-          opened=$(gh issue list --repo "$REPO" --label security --state open --limit 200 --json body --jq '.[].body' \
-                     | grep -cF "**Detected in release:** \`v${VERSION}\`" || true)
-          check "open CVE issues opened by v${VERSION}" "${opened:-0}" "0"
-
-          hub_tag=$(curl -s -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/")
-          if [ "$HUB_KEPT" = "true" ]; then
-            check "Docker Hub ${VERSION} (immutable, stays)" "$hub_tag" "200"
-          else
-            check "Docker Hub ${VERSION}" "$hub_tag" "404"
-          fi
-          for pkg in "cert-manager-webhook-freemyip" "charts%2Fcert-manager-webhook-freemyip"; do
-            n=$(gh api --paginate "users/${OWNER}/packages/container/${pkg}/versions" \
-                  --jq "[.[] | select(.metadata.container.tags | index(\"${VERSION}\"))] | length" 2>/dev/null | awk '{s+=$1} END{print s+0}')
-            check "ghcr ${pkg//%2F//} tagged ${VERSION}" "$n" "0"
-          done
-          if [ -n "$DIGEST" ]; then
-            hub_latest=$(curl -s "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/latest/" | jq -r '.digest // "none"')
-            if [ "$hub_latest" = "$DIGEST" ]; then check "Docker Hub latest" "still ${VERSION}" "moved off it"; else row "Docker Hub latest" "$hub_latest" "ok"; fi
-            if [ "$HUB_KEPT" != "true" ]; then
-              # Exit status, not output: on an error gh prints the error body to stdout.
-              # A 404 means none are left; any other failure is not a pass.
-              if att=$(gh api "repos/${REPO}/attestations/${DIGEST}" --jq '.attestations | length' 2>/dev/null); then
-                :
-              elif printf '%s' "$att" | grep -q '"status":"404"'; then
-                att=0
-              else
-                att="unreadable"
-              fi
-              check "attestation records for the digest" "$att" "0"
-            fi
-          fi
-
-          # The release now live must be untouched.
-          if [ -n "$PREV" ]; then
-            check "release v${PREV} (live)" "$(present gh release view "v${PREV}" --repo "$REPO")" "present"
-            check "chart index advertises ${PREV}" "$(printf '%s' "$idx" | grep -cE "^[[:space:]]+version: ${PREV}$")" "1"
-            check "Docker Hub ${PREV}" "$(curl -s -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${PREV}/")" "200"
-          fi
-
-          if [ "$fails" -gt 0 ]; then
-            echo "::error::${fails} location(s) still hold ${VERSION}, or the live release was disturbed — see the summary. Re-run this workflow once the cause is fixed; every step skips what is already gone."
-            exit 1
-          fi
-          echo "${VERSION} is withdrawn everywhere it can be"
+          STEPS: >-
+            pages ${{ needs.withdraw_pages.result }}, Docker Hub page ${{ needs.withdraw_hub_page.result }},
+            issues ${{ needs.withdraw_issues.result }}, latest ${{ needs.withdraw_latest.result }},
+            records ${{ needs.withdraw_records.result }}, ghcr ${{ needs.withdraw_packages.result }},
+            Docker Hub tag ${{ needs.withdraw_image.result }}, attestations ${{ needs.withdraw_attestations.result }}
+        run: ./scripts/withdraw/verify.sh
