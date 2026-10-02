@@ -59,8 +59,8 @@ for f in "$WF"/*.y*ml; do
     inblk && /^[^[:space:]]/ {inblk=0}
     inblk && /:[[:space:]]*write([[:space:]]|$)/ {print}
   ' "$f")
-  [ -z "$w" ] && ok "$(basename "$f"): none" \
-              || { bad "$(basename "$f"): workflow-level write permission"; printf '%s\n' "$w" | sed 's/^/        /'; }
+  if [ -z "$w" ]; then ok "$(basename "$f"): none"
+  else bad "$(basename "$f"): workflow-level write permission"; printf '%s\n' "$w" | sed 's/^/        /'; fi
 done
 
 # ── 4. no publish credentials in pull_request-triggered workflows ────────────
@@ -70,8 +70,8 @@ for f in "$WF"/*.y*ml; do
   # Needles are written with an explicit space class before the colon so this
   # line does not itself look like a leaked credential to the outbound guard.
   hits=$(grep -nE 'password[[:space:]]*:|NODE_AUTH[_]TOKEN|PYPI_API[_]TOKEN|OSSRH[_]PASSWORD|push:[[:space:]]*true' "$f")
-  [ -z "$hits" ] && ok "$(basename "$f"): clean" \
-                 || { bad "$(basename "$f"): PR-triggered and carries publish capability"; printf '%s\n' "$hits" | sed 's/^/        /'; }
+  if [ -z "$hits" ]; then ok "$(basename "$f"): clean"
+  else bad "$(basename "$f"): PR-triggered and carries publish capability"; printf '%s\n' "$hits" | sed 's/^/        /'; fi
 done
 
 # ── 4b. every job states its own permissions ─────────────────────────────────
@@ -138,7 +138,7 @@ if [ -d docs/pages ]; then
     if grep -qiE '<script' "$f" && grep -iE '<script' "$f" | grep -qvF 'application/ld+json'; then
       bad="${bad} inline-script"
     fi
-    [ -z "$bad" ] && ok "$(basename "$f"): inert" || bad "$(basename "$f"):${bad}"
+    if [ -z "$bad" ]; then ok "$(basename "$f"): inert"; else bad "$(basename "$f"):${bad}"; fi
   done
 else
   ok "no published pages"
@@ -225,7 +225,15 @@ for f in "$WF"/*.y*ml; do
     match($0, /^[[:space:]]*/) { ind = RLENGTH }
     /^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*[|>]?[[:space:]]*$/ ||
     /^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*[^|>[:space:]]/ {
-      inrun = 1; runind = ind; next
+      # In "- run: |" the key sits after the dash, so the keys of the step
+      # (env:, if:) are indented to the key, not to the dash. Measuring from the
+      # dash read the env: block below such a step as part of its script.
+      inrun = 1; runind = ind
+      if (match($0, /^[[:space:]]*-[[:space:]]+/)) runind = RLENGTH
+      # A one-line run: is its own script. Check the line itself, which the
+      # block logic below never sees.
+      if ($0 ~ /run:[[:space:]]*[^|>[:space:]]/ && $0 ~ /\$\{\{/) printf "%s:%d:%s\n", F, NR, $0
+      next
     }
     inrun && ind <= runind && NF > 0 { inrun = 0 }
     # Any expansion, not a list of contexts. Naming contexts is how this
@@ -250,13 +258,13 @@ head_ "artipacked — checkout must not persist credentials"
 # setting, which is the one finding in this file that must never be noise.
 n_co=$(grep -rhE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*actions/checkout@' "$WF" 2>/dev/null | wc -l | tr -d ' ')
 n_pc=$(grep -rhE '^[[:space:]]*persist-credentials:[[:space:]]*false' "$WF" 2>/dev/null | wc -l | tr -d ' ')
-[ "$n_co" = "$n_pc" ] && ok "$n_pc/$n_co checkouts set persist-credentials: false" \
-                      || bad "$n_pc/$n_co checkouts set persist-credentials: false"
+if [ "$n_co" = "$n_pc" ]; then ok "$n_pc/$n_co checkouts set persist-credentials: false"
+else bad "$n_pc/$n_co checkouts set persist-credentials: false"; fi
 
 # ── 8. concurrency declared ──────────────────────────────────────────────────
 head_ "concurrency"
 for f in "$WF"/*.y*ml; do
-  grep -q '^concurrency:' "$f" && ok "$(basename "$f")" || bad "$(basename "$f"): no concurrency group"
+  if grep -q '^concurrency:' "$f"; then ok "$(basename "$f")"; else bad "$(basename "$f"): no concurrency group"; fi
 done
 
 # ── 9. release workflow is human-triggered only ──────────────────────────────
@@ -308,10 +316,10 @@ head_ "Supply chain — published images are attested"
 for f in "$WF"/release.y*ml; do
   [ -e "$f" ] || continue
   if grep -qE 'push:[[:space:]]*true' "$f"; then
-    grep -qE '^[[:space:]]*provenance:' "$f" && ok "$(basename "$f"): provenance set" \
-                                             || bad "$(basename "$f"): pushes without provenance:"
-    grep -qE '^[[:space:]]*sbom:' "$f"       && ok "$(basename "$f"): sbom set" \
-                                             || bad "$(basename "$f"): pushes without sbom:"
+    if grep -qE '^[[:space:]]*provenance:' "$f"; then ok "$(basename "$f"): provenance set"
+    else bad "$(basename "$f"): pushes without provenance:"; fi
+    if grep -qE '^[[:space:]]*sbom:' "$f"; then ok "$(basename "$f"): sbom set"
+    else bad "$(basename "$f"): pushes without sbom:"; fi
   fi
 done
 
@@ -495,9 +503,10 @@ head_ "No job can start workflows; nothing is a called workflow"
 awjobs=$(awk '/^jobs:/{j=1;next} j && /^  [A-Za-z0-9_-]+:[[:space:]]*$/{job=$1} j && /^      actions:[[:space:]]*write/{print FILENAME":"job}' "$WF"/*.y*ml)
 if [ -z "$awjobs" ]; then ok "no job has actions: write"; else bad "jobs that can start workflows: $(printf '%s' "$awjobs" | tr '\n' ' ')"; fi
 calls=$(grep -rnE '^[[:space:]]+uses:[[:space:]]*\./\.github/workflows/' "$WF" 2>/dev/null || true)
-[ -z "$calls" ] && ok "no job calls another workflow" || { bad "a job calls another workflow — its environment secrets would not arrive:"; printf '%s\n' "$calls" | sed 's/^/        /'; }
+if [ -z "$calls" ]; then ok "no job calls another workflow"
+else bad "a job calls another workflow — its environment secrets would not arrive:"; printf '%s\n' "$calls" | sed 's/^/        /'; fi
 callable=$(grep -lE '^[[:space:]]+workflow_call:' "$WF"/*.y*ml 2>/dev/null || true)
-[ -z "$callable" ] && ok "no workflow is callable" || bad "callable workflows: ${callable}"
+if [ -z "$callable" ]; then ok "no workflow is callable"; else bad "callable workflows: ${callable}"; fi
 
 # ── 12e. a failed gh api call is judged by its exit status ───────────────────
 # On an error, gh prints the response body — the error JSON — to stdout. So
@@ -548,6 +557,37 @@ for f in "$WF"/*.y*ml; do
 done > /tmp/_undo.txt
 [ -s /tmp/_undo.txt ] && cat /tmp/_undo.txt || echo "  ok    no undo jobs"
 grep -q FAIL /tmp/_undo.txt && FAIL=1; rm -f /tmp/_undo.txt
+
+# ── 12g. nothing pushes to the default branch ────────────────────────────────
+# The default branch changes through reviewed pull requests only; its ruleset
+# refuses anything else. A workflow that pushes to it, or writes a file on it
+# through the contents API, is either broken the day it runs or bypassing the
+# review, so neither is allowed anywhere. Tags come from `gh release create`,
+# and automation that proposes a change opens a pull request.
+head_ "Nothing pushes to the default branch"
+for f in "$WF"/*.y*ml scripts/*.sh scripts/withdraw/*.sh; do
+  [ -e "$f" ] || continue
+  # One logical command per line: a call split with trailing backslashes is
+  # joined first, so its -f branch=... on a later line is seen with it.
+  cmds=$(awk '
+    buf == "" && /^[[:space:]]*#/ { next }
+    { line = $0; if (buf != "") { buf = buf " " line } else { buf = line; start = NR } }
+    /\\$/ { sub(/\\$/, "", buf); next }
+    { printf "%d:%s\n", start, buf; buf = "" }
+  ' "$f")
+  # A push naming main, master or HEAD, or naming no branch at all (which
+  # pushes the current one). Pushing a pull-request branch is how automation
+  # proposes a change, and stays allowed.
+  printf '%s\n' "$cmds" | grep -E '^[0-9]+:[^#]*git[[:space:]]+push' \
+    | grep -E '(master|main|HEAD)([^A-Za-z0-9_/-]|$)|git[[:space:]]+push[[:space:]]*("[^"]*"|[^[:space:]]+)?[[:space:]]*$' \
+    | sed "s|^|${f}:|"
+  # A contents-API write that does not name the gh-pages branch lands on the
+  # default branch.
+  printf '%s\n' "$cmds" | grep -E '^[0-9]+:[^#]*gh api[^#]*(-X|--method)[[:space:]]*(PUT|DELETE)[^#]*contents/' \
+    | grep -v 'branch=gh-pages' | sed "s|^|${f}:|"
+done > /tmp/_push.txt
+if [ -s /tmp/_push.txt ]; then bad "writes to a branch:"; sed 's/^/        /' /tmp/_push.txt; else ok "none"; fi
+rm -f /tmp/_push.txt
 
 # ── 13. every pin resolves to the version its comment claims ─────────────────
 # A SHA that is real but belongs to a different release is indistinguishable
