@@ -1,0 +1,399 @@
+# Take a published release back: every trace of it that reached the outside.
+#
+# A release that fails before its Docker Hub version tag rolls itself back, in
+# its own run, with the same steps as this workflow: scripts/withdraw/. This
+# workflow is for everything else, such as a finished release that turned out to
+# be wrong, or a rollback that has to be finished by hand.
+#
+# WHAT A RELEASE WRITES, AND WHICH STEP UNDOES IT
+#
+#   pages     the Docker Hub page (with the scan)             hub_page.sh
+#             gh-pages index.html / robots.txt / sitemap.xml  pages.sh
+#   CVE list  [SECURITY] issues and their comments            issues.sh
+#   latest    on Docker Hub and on ghcr                       latest.sh    (moved back, not deleted)
+#   records   GitHub releases (the scan is in the notes),     records.sh
+#             git tags, the "Latest" marker, the chart
+#             repository index and .tgz on gh-pages
+#   packages  OCI chart and image on ghcr, with every child   packages.sh
+#             manifest and the provenance referrer
+#   image     version tag on Docker Hub                       image.sh
+#   proof     GitHub attestation records for the digest       attestations.sh
+#
+# Nobody can undo three things, and this workflow does not pretend to: the
+# Sigstore transparency-log entry (append-only by design), the gh-pages git
+# history (that would take a force-push of the published branch), and a Docker
+# Hub version tag covered by a tag-immutability rule. A finished release has
+# such a tag. A release rolled back part-way never does, because the release
+# creates its version tag last.
+#
+# ORDER is the exact reverse of publication, so whatever is still advertised is
+# always still resolvable:
+#
+#   publish    image → OCI chart → index → releases → latest → pages, CVE list
+#   withdraw   pages, CVE list → latest → releases → index → OCI chart → image
+#
+# ALL OR NOTHING. There are no per-artefact switches: each step runs only if the
+# one before it succeeded, so a failure stops the unwind with what remains still
+# consistent with itself. Every step skips what is already gone, so a re-run
+# finishes the job.
+#
+# CREDENTIALS, one kind per job:
+#
+#   withdraw_pages         GITHUB_TOKEN          contents: write
+#   withdraw_hub_page      Docker Hub password   environment dockerhub-metadata
+#   withdraw_issues        GITHUB_TOKEN          issues: write
+#   withdraw_latest        Docker Hub token      environment release, packages: write
+#   withdraw_records       GITHUB_TOKEN          contents: write
+#   withdraw_packages      GITHUB_TOKEN          packages: write
+#   withdraw_image         Docker Hub token      environment release
+#   withdraw_attestations  GITHUB_TOKEN          attestations: write
+#
+# No personal token is involved. Nothing here is a called workflow: a called
+# workflow's jobs never received their environments' secrets.
+name: Withdraw a release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to withdraw, without the leading v (e.g. 0.1.0)"
+        required: true
+        type: string
+      confirm:
+        description: "Type the same version again to confirm. Everything this version published is removed."
+        required: true
+        type: string
+
+# Its own group, not the release group: a withdrawal must not queue behind a
+# release, and a release must not be cancelled by a withdrawal. Both are safe
+# side by side, because every step skips what is already gone.
+concurrency:
+  group: withdraw
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Not gated, and it runs first. The person approving is shown exactly what
+  # exists and what will happen to it, not asked to approve a version number.
+  plan:
+    name: "What will be withdrawn"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # read: resolving the digest from ghcr when Docker Hub no longer has it.
+      packages: read
+    outputs:
+      version: ${{ steps.p.outputs.version }}
+      hub_repo: ${{ steps.p.outputs.hub_repo }}
+      digest: ${{ steps.p.outputs.digest }}
+      prev: ${{ steps.p.outputs.prev }}
+      found: ${{ steps.p.outputs.found }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Typing it twice is the only protection against withdrawing the wrong
+      # version, and nothing after the approval can be taken back.
+      - name: Confirm the version
+        id: c
+        env:
+          VERSION: ${{ inputs.version }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -uo pipefail
+          version=$(printf '%s' "$VERSION" | tr -d '[:space:]'); version="${version#v}"
+          confirm=$(printf '%s' "$CONFIRM" | tr -d '[:space:]'); confirm="${confirm#v}"
+          if [ -z "$version" ] || [ "$version" != "$confirm" ]; then
+            echo "::error::confirmation does not match: got '${confirm}', expected '${version}'"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Find what this version left behind
+        id: p
+        env:
+          VERSION: ${{ steps.c.outputs.version }}
+          HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+        run: ./scripts/withdraw/plan.sh
+
+  # The approval, in the environment that carries the reviewer. It holds no
+  # secrets and deletes nothing: the job that asks is not the job that acts.
+  confirm:
+    name: "⚠️ Approve to WITHDRAW everything listed above"
+    needs: [plan]
+    if: needs.plan.outputs.found == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Record the decision
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: echo "withdrawal of ${VERSION} approved"
+
+  # ── 0. what describes the release ─────────────────────────────────────────
+  withdraw_pages:
+    name: "0. Roll back the gh-pages page sources"
+    needs: [plan, confirm]
+    if: always() && needs.confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore what this version changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ./scripts/withdraw/pages.sh
+
+  # A top-level job, so its environment's secret arrives. The account password
+  # reaches a script in this repository and nothing else.
+  withdraw_hub_page:
+    name: "0. Roll back the Docker Hub page"
+    needs: [plan, confirm, withdraw_pages]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_pages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore the page to the live release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/withdraw/hub_page.sh
+
+  withdraw_issues:
+    name: "0. Roll back the CVE issues"
+    needs: [plan, confirm, withdraw_hub_page]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_hub_page.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Close or re-point the issues, delete the comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+        run: ./scripts/withdraw/issues.sh
+
+  # ── 1. latest ─────────────────────────────────────────────────────────────
+  withdraw_latest:
+    name: "1. Move latest back"
+    needs: [plan, confirm, withdraw_issues]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_issues.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Move latest back, or remove it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          PREV: ${{ needs.plan.outputs.prev }}
+        run: ./scripts/withdraw/latest.sh
+
+  # ── 2 and 3. the records ──────────────────────────────────────────────────
+  withdraw_records:
+    name: "2. Remove the releases, tags and chart index"
+    needs: [plan, confirm, withdraw_latest]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_latest.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the releases and tags, hand back Latest, remove the index entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+        run: ./scripts/withdraw/records.sh
+
+  # ── 4. the ghcr packages ──────────────────────────────────────────────────
+  # packages: write on the run's own token. validate.sh fails any job asking
+  # for it without release-approval upstream.
+  withdraw_packages:
+    name: "4. Remove the ghcr packages"
+    needs: [plan, confirm, withdraw_records]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_records.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Delete the chart, then the image, on ghcr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ./scripts/withdraw/packages.sh
+
+  # ── 5. the Docker Hub version tag ─────────────────────────────────────────
+  withdraw_image:
+    name: "5. Remove the Docker Hub version tag"
+    needs: [plan, confirm, withdraw_packages]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_packages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      removed: ${{ steps.i.outputs.removed }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the tag, unless it is immutable
+        id: i
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: ./scripts/withdraw/image.sh
+
+  # ── 6. the attestation records ────────────────────────────────────────────
+  # Kept while an immutable tag still serves the image: stripping the proof from
+  # an image people can still pull would be worse than leaving both.
+  withdraw_attestations:
+    name: "6. Remove the attestation records"
+    needs: [plan, confirm, withdraw_image]
+    if: always() && needs.confirm.result == 'success' && needs.withdraw_image.result == 'success' && needs.withdraw_image.outputs.removed == 'true' && needs.plan.outputs.digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the attestations for the digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+        run: ./scripts/withdraw/attestations.sh
+
+  verify:
+    name: "Verify: nothing of this version is left"
+    needs: [plan, confirm, withdraw_pages, withdraw_hub_page, withdraw_issues, withdraw_latest, withdraw_records, withdraw_packages, withdraw_image, withdraw_attestations]
+    if: always() && needs.confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      packages: read
+      attestations: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check every location
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.plan.outputs.hub_repo }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREV: ${{ needs.plan.outputs.prev }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          HUB_KEPT: ${{ needs.withdraw_image.outputs.removed == 'false' }}
+          STEPS: >-
+            pages ${{ needs.withdraw_pages.result }}, Docker Hub page ${{ needs.withdraw_hub_page.result }},
+            issues ${{ needs.withdraw_issues.result }}, latest ${{ needs.withdraw_latest.result }},
+            records ${{ needs.withdraw_records.result }}, ghcr ${{ needs.withdraw_packages.result }},
+            Docker Hub tag ${{ needs.withdraw_image.result }}, attestations ${{ needs.withdraw_attestations.result }}
+        run: ./scripts/withdraw/verify.sh

@@ -1,6 +1,9 @@
 ---
 apiVersion: v2
 name: cert-manager-webhook-freemyip
+# The last published release. The release does not read this: it works its
+# version out from the last published GitHub release and stamps that into
+# every chart it publishes, so a stale value here cannot mis-number a release.
 version: 0.1.0
 appVersion: "0.1.0"
 description: cert-manager ACME DNS-01 webhook solver for freemyip.com

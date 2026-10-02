@@ -15,3 +15,18 @@ rules:
       # appearing outside environment: release still fails the build — and
       # scripts/validate.sh asserts that separately.
       - integration_tests.yaml
+
+      # Same two secrets, in the release workflow's integration_check job. That
+      # job has to run and pass *before* the reviewer is asked to approve —
+      # approving a release whose end-to-end test has not run yet would defeat
+      # the point of the gate — so it cannot itself sit behind
+      # environment: release.
+      - release.yaml
+
+      # CVE_AUTOFIX_TOKEN in the scheduled scan's auto-fix job. It is a
+      # fine-grained token limited to contents and pull requests, so it can
+      # neither publish nor approve a deployment: GitHub's approval endpoint
+      # accepts only OAuth app tokens and classic PATs with repo scope. Gating
+      # this job on the release environment would make the weekly scan wait for
+      # a human every week, which is the opposite of what it is for.
+      - scan_vulnerabilities.yaml

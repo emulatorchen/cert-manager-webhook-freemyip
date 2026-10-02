@@ -3,17 +3,35 @@ name: release
 # Releases are started by a person, never by a ref appearing. Every job that
 # can publish declares environment: release, so it parks for a reviewer before
 # any credential is exposed to it.
+#
+# That gate is the supply-chain control, and it holds by construction:
+# GitHub's approval endpoint accepts only OAuth app tokens and classic PATs
+# with repo scope, and required reviewers can only be users or teams. GITHUB_TOKEN
+# is an App installation token and is not a reviewer, so no job in this workflow
+# — compromised or not — can approve its own deployment. Keep it that way: never
+# store a classic repo-scoped PAT belonging to a reviewer as a secret here.
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, without the leading v (e.g. 0.2.0). Blank uses the chart appVersion."
-        required: false
-        default: ""
+      # No version input. Like docker-nginx-lego, the release works its own
+      # version out; unlike it, this project has a real semver, so the only
+      # choice left to a person is how far to move it.
+      bump:
+        description: "How to move from the last published release: patch (0.1.0 → 0.1.1), minor (→ 0.2.0) or major (→ 1.0.0)"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
       notes:
-        description: "Release notes. Blank auto-generates them from merged pull requests."
+        description: "Release notes. Blank auto-generates them from merged pull requests; text is prepended before the generated notes unless override is checked."
         required: false
         default: ""
+      override_notes:
+        description: "Use only the notes above, discarding the auto-generated ones"
+        type: boolean
+        default: false
       block_severity:
         description: "Severities that block the release. Start at CRITICAL; tighten to CRITICAL,HIGH once the pipeline is proven."
         type: choice
@@ -38,54 +56,247 @@ jobs:
   resolve:
     name: "Resolve version"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       ghcr_image: ${{ steps.v.outputs.ghcr_image }}
+      # Two forms on purpose: the registry wants docker.io/owner/name, the
+      # Docker Hub web API wants owner/name.
       hub_image: ${{ steps.v.outputs.hub_image }}
+      hub_repo: ${{ steps.v.outputs.hub_repo }}
       charts: ${{ steps.v.outputs.charts }}
+    permissions:
+      contents: read
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       # ghcr.io rejects uppercase in repository names, but github.repository
       # and github.repository_owner preserve the owner's casing.
+      # The version is worked out, never typed — docker-nginx-lego's model,
+      # carried over and tightened:
+      #
+      # - It counts from the last PUBLISHED release, not from tags. A draft, a
+      #   pre-release, or an attempt that was rolled back publishes nothing, so
+      #   the next run computes the same number again. Failed attempts never
+      #   advance the version (lego pushes its tag in this first job, before
+      #   any approval, so a rejected run still consumes one).
+      # - Nothing is written here. The tag appears with the GitHub release,
+      #   after the approval, and the rollback removes it.
+      # - The chart's version is stamped at packaging time, as the digest is,
+      #   so there is no second copy of the number to keep in step.
       - name: Resolve version and targets
         id: v
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
           HUB_REPO: ${{ vars.DOCKERHUB_REPOSITORY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          version="$INPUT_VERSION"
-          if [ -z "$version" ]; then
-            version=$(grep -m1 '^appVersion:' charts/cert-manager-webhook-freemyip/Chart.yaml \
-                      | sed 's/^appVersion:[[:space:]]*//; s/"//g')
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+                     --limit 100 --json tagName --jq '.[].tagName' \
+                   | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            version="0.1.0"
+            echo "no published release yet — starting at ${version}"
+          else
+            IFS=. read -r major minor patch <<< "$latest"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="${major}.$((minor + 1)).0" ;;
+              patch) version="${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::unknown bump '${BUMP}'"; exit 1 ;;
+            esac
+            echo "last published release ${latest}, ${BUMP} bump -> ${version}"
           fi
-          [ -n "$version" ] || { echo "could not resolve a version"; exit 1; }
+          # Exactly X.Y.Z: it is also what Docker Hub's immutability rule matches.
+          printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::'${version}' is not X.Y.Z"; exit 1; }
           if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
             echo "tag v${version} already exists — bump the version, or delete the tag to re-release"
+            exit 1
+          fi
+          # chart-releaser tags independently, under the chart's name. It is a
+          # separate name space that fails on its own, and it fails *after* the
+          # image has been pushed — so both names have to be clear up front.
+          if git ls-remote --exit-code --tags origin "refs/tags/cert-manager-webhook-freemyip-${version}" >/dev/null 2>&1; then
+            echo "tag cert-manager-webhook-freemyip-${version} already exists — the chart publish would fail with the image already pushed. Delete it, or bump the version."
             exit 1
           fi
           if [ -z "$HUB_REPO" ]; then
             echo "repository variable DOCKERHUB_REPOSITORY is not set (expected e.g. emulator/cert-manager-webhook-freemyip)"
             exit 1
           fi
+          # An earlier attempt that failed and was not rolled back leaves the
+          # chart repository advertising this version, and chart-releaser would
+          # then fail half-way through. Refuse up front and say how to clear it.
+          #
+          # Read from the gh-pages branch, not the Pages site: the site lags the
+          # branch by a build and a CDN cache, so a withdrawal completed minutes
+          # ago would still look live there and block a legitimate retry.
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/index.yaml?ref=gh-pages" --jq '.content' 2>/dev/null \
+             | base64 -d | grep -qE "^[[:space:]]+version: ${version}\$"; then
+            echo "::error::the chart repository already advertises ${version}, left by an earlier attempt that was not rolled back. Run 'Withdraw a release' for ${version}, then release again."
+            exit 1
+          fi
+          # Refuse a version that is already published somewhere it cannot be
+          # overwritten. A Docker Hub tag rule makes version tags immutable, so
+          # discovering the clash at push time means a half-published run and a
+          # version number burned. Checked through the public API, so this needs
+          # no credentials and runs before the reviewer is asked for anything.
+          #
+          # ghcr is deliberately NOT checked: its tags are overwritable, so
+          # leftovers from a failed run must not block a legitimate retry of the
+          # same version.
+          # A bare curl under `set -e` turns a DNS blip into a failed release,
+          # and treats every non-200 as "safe to proceed" — including the 401
+          # or 404 you get from a private repository or a typo in the variable,
+          # where the guard would be protecting nothing. Retry, and only accept
+          # a clean 200 or 404 as an answer.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --retry 3 --retry-all-errors --max-time 30 \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${version}/" || echo "000")
+          case "$code" in
+            200)
+              echo "::error::${HUB_REPO}:${version} is already published on Docker Hub. The version tag is the last thing a release writes, so this version was released in full. Pick another version — a release never overwrites a published one, and this tag is immutable."
+              exit 1
+              ;;
+            404)
+              echo "${HUB_REPO}:${version} is not published yet"
+              ;;
+            *)
+              echo "::error::could not determine whether ${HUB_REPO}:${version} is already published (HTTP ${code}). Refusing to release blind — check DOCKERHUB_REPOSITORY and that the repository is public."
+              exit 1
+              ;;
+          esac
+
           {
             echo "version=${version}"
             echo "tag=v${version}"
             echo "ghcr_image=ghcr.io/${GITHUB_REPOSITORY,,}"
-            echo "hub_image=${HUB_REPO}"
+            # Fully qualified for the registry and for attestation subjects,
+            # which reject a bare owner/name.
+            echo "hub_image=docker.io/${HUB_REPO}"
+            echo "hub_repo=${HUB_REPO}"
             echo "charts=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
           } >> "$GITHUB_OUTPUT"
           echo "Releasing ${version} to ghcr.io/${GITHUB_REPOSITORY,,} and ${HUB_REPO}"
+
+  # Everything the reviewer should have read before pressing approve, in one
+  # place. Informational only — it never blocks. The blocking equivalents are
+  # workflow_scan and scan below.
+  security_preflight:
+    # Not "... summary": GitHub appends the word itself, so the heading above
+    # the report read "Security preflight summary summary".
+    name: "Security preflight"
+    needs: resolve
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint v1.7.12 and zizmor v1.23.1
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/bin/"
+
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          mv zizmor "${RUNNER_TEMP}/bin/"
+
+          rm -f actionlint.tar.gz zizmor.tar.gz
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      # Both tools colour their output, and a step summary is Markdown, not a
+      # terminal — the escape sequences render as literal `?[32m` noise that
+      # makes the report harder to read than no report at all. NO_COLOR asks
+      # them not to emit it; the sed strips anything that slips through, such
+      # as the banner zizmor prints regardless.
+      - name: Run the analysers
+        env:
+          NO_COLOR: "1"
+        run: |
+          zizmor --format plain --no-online-audits .github/workflows/ 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' > /tmp/zizmor.txt || true
+          actionlint -no-color .github/workflows/*.y*ml 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' > /tmp/actionlint.txt || true
+
+      - name: List open security issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue list --repo "$REPO" --label security --state open \
+            --json number,title --jq '.[] | "  #\(.number): \(.title)"' \
+            > /tmp/issues.txt 2>/dev/null || true
+
+      - name: Write the summary
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          {
+            echo "## Security preflight — ${VERSION}"
+            echo ""
+            echo "Read this before approving the release environment gate."
+            echo ""
+            echo "### Workflow static analysis (zizmor)"
+            if [ -s /tmp/zizmor.txt ]; then
+              echo '```'; cat /tmp/zizmor.txt; echo '```'
+            else
+              echo "No findings."
+            fi
+            echo ""
+            echo "### Workflow linting (actionlint)"
+            if [ -s /tmp/actionlint.txt ]; then
+              echo '```'; cat /tmp/actionlint.txt; echo '```'
+            else
+              echo "No findings."
+            fi
+            echo ""
+            echo "### Open security issues"
+            if [ -s /tmp/issues.txt ]; then
+              echo "Approving releases with these still open:"
+              echo '```'; cat /tmp/issues.txt; echo '```'
+            else
+              echo "None open."
+            fi
+            echo ""
+            echo "---"
+            echo "_Informational only. This job never blocks a release._"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   verify:
     name: "Build and vet"
     needs: resolve
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -102,15 +313,209 @@ jobs:
           helm template release-check charts/cert-manager-webhook-freemyip \
             --set image.tag="$VERSION" > /dev/null
 
+  # The workflows are part of the supply chain too: they hold the credentials
+  # and decide what gets published. Scanning the artifact but not the thing
+  # that publishes it leaves the more privileged half unchecked.
+  workflow_scan:
+    name: "Workflow security gate"
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Extracted onto PATH rather than installed system-wide: each tool is
+      # used by one step, so elevating for it buys nothing.
+      - name: Install actionlint v1.7.12 and zizmor v1.23.1
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 3 --retry-all-errors -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/bin/"
+
+          curl -fsSL --retry 3 --retry-all-errors -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v1.23.1/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "67a8df0a14352dd81882e14876653d097b99b0f4f6b6fe798edc0320cff27aff  zizmor.tar.gz" | sha256sum -c -
+          tar xzf zizmor.tar.gz
+          mv zizmor "${RUNNER_TEMP}/bin/"
+
+          rm -f actionlint.tar.gz zizmor.tar.gz
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      - name: Scan the workflows
+        env:
+          BLOCK_SEVERITY: ${{ inputs.block_severity }}
+          # Needed for the pin-versus-tag check; without it that check skips and
+          # a SHA pinned to the wrong version would sail through the gate.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/validate.sh
+
+  # The release proves the thing it is about to publish actually works, in the
+  # run that publishes it — a real ACME order against Let's Encrypt staging,
+  # through kind, cert-manager and this chart. docker-nginx-lego gates all of
+  # its publishes on the same check.
+  #
+  # Job-level concurrency, not workflow-level: freemyip stores exactly one TXT
+  # value per domain, so this must never run beside the integration-tests
+  # workflow, which shares this group.
+  integration_check:
+    name: "Integration test (DNS-01 staging certificate)"
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: freemyip-dns
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Check configuration
+        id: check
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$DOMAIN" ] || [ -z "$EMAIL" ]; then
+            echo "::error::FREEMYIP_TOKEN, FREEMYIP_DOMAIN or CERTBOT_EMAIL is missing — a release must not publish untested"
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the webhook image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          tags: webhook:release-check
+
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: release-check
+
+      - name: Install cert-manager and the webhook
+        env:
+          TOKEN: ${{ secrets.FREEMYIP_TOKEN }}
+          EMAIL: ${{ secrets.CERTBOT_EMAIL }}
+        run: |
+          set -euo pipefail
+          kind load docker-image webhook:release-check --name release-check
+
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update jetstack
+
+          # cert-manager checks the record itself before asking Let's Encrypt to,
+          # by default against the zone's authoritative nameservers. From inside
+          # kind on a runner that lookup does not complete, so the challenge sits
+          # pending until the order expires. Pin the self-check to recursive
+          # resolvers reachable over the path that works.
+          cat > /tmp/cm-values.yaml <<'EOF'
+          crds:
+            enabled: true
+          extraArgs:
+            - --dns01-recursive-nameservers-only
+            - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
+          EOF
+
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            -f /tmp/cm-values.yaml \
+            --wait --timeout 10m
+
+          # A values file rather than --set: the token never reaches the process
+          # list, where anything on the runner could read it.
+          umask 077
+          cat > /tmp/values.yaml <<EOF
+          image:
+            repository: webhook
+            tag: release-check
+            pullPolicy: Never
+          freemyip:
+            "token": "${TOKEN}"
+          clusterIssuer:
+            email: "${EMAIL}"
+            staging:
+              create: true
+          EOF
+
+          helm upgrade --install cert-manager-webhook-freemyip \
+            charts/cert-manager-webhook-freemyip \
+            --namespace cert-manager \
+            -f /tmp/values.yaml \
+            --wait --timeout 5m
+          rm -f /tmp/values.yaml
+
+      - name: Request a staging certificate
+        env:
+          DOMAIN: ${{ vars.FREEMYIP_DOMAIN }}
+        run: |
+          set -euo pipefail
+          # One DNS name only: freemyip stores a single TXT value per domain.
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: release-check
+            namespace: default
+          spec:
+            secretName: release-check-tls
+            issuerRef:
+              name: cert-manager-webhook-freemyip-staging
+              kind: ClusterIssuer
+            dnsNames:
+              - ${DOMAIN}
+          EOF
+          kubectl wait --for=condition=Ready certificate/release-check -n default --timeout=8m
+
+      - name: Show what happened on failure
+        if: failure()
+        run: |
+          kubectl describe certificate/release-check -n default || true
+          kubectl get certificaterequest,order,challenge -A || true
+          kubectl describe challenge -A || true
+          kubectl describe order -A || true
+          kubectl logs -n cert-manager -l app.kubernetes.io/name=cert-manager-webhook-freemyip --tail=200 || true
+          kubectl logs -n cert-manager -l app=cert-manager --tail=200 || true
+
+      - name: Clean up the challenge record
+        if: always()
+        run: kubectl delete certificate/release-check -n default --ignore-not-found || true
+
   scan:
     name: "Vulnerability gate"
-    needs: [resolve, verify]
+    needs: [resolve, verify, integration_check]
     if: ${{ !inputs.skip_security_scan }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -119,8 +524,28 @@ jobs:
           go-version-file: go.mod
 
       # Reachability-aware: only reports advisories our code can actually call.
+      #
+      # The Go advisory database carries no severity, so this cannot be filtered
+      # the way the image scan can. It follows the same bar instead: at
+      # CRITICAL it reports and lets the release through, at CRITICAL,HIGH it
+      # blocks. Findings are always printed either way.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        env:
+          BLOCK: ${{ inputs.block_severity }}
+        run: |
+          if go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...; then
+            echo "no reachable vulnerabilities"
+          else
+            case "$BLOCK" in
+              *HIGH*)
+                echo "::error::govulncheck found reachable vulnerabilities and the bar is ${BLOCK}"
+                exit 1
+                ;;
+              *)
+                echo "::warning::govulncheck found reachable vulnerabilities — not blocking at the ${BLOCK} bar"
+                ;;
+            esac
+          fi
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build the release image locally for scanning
@@ -130,6 +555,9 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
+          # Force a fresh base pull, so the thing scanned here is the thing the
+          # publish job builds rather than a cached layer.
+          pull: true
           tags: scan-target:release
 
       # Two passes, deliberately. The first is the gate and is the only one
@@ -137,11 +565,17 @@ jobs:
       # from CRITICAL to CRITICAL,HIGH without editing this file. The second
       # always records the full CRITICAL,HIGH picture to the security tab, so
       # raising the bar later is an informed decision rather than a guess.
+      #
+      # ignore-unfixed: a CVE with no upstream fix cannot be acted on, and
+      # blocking on it means the gate can never be tightened. Accepting one
+      # deliberately is what .trivyignore is for.
       - name: Vulnerability gate
         uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
         with:
           scan-ref: scan-target:release
           severity: ${{ inputs.block_severity }}
+          ignore-unfixed: true
+          trivyignores: .trivyignore
           format: table
           exit-code: 1
 
@@ -151,6 +585,7 @@ jobs:
         with:
           scan-ref: scan-target:release
           severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
           format: sarif
           output: trivy-release.sarif
           exit-code: 0
@@ -162,15 +597,183 @@ jobs:
           sarif_file: trivy-release.sarif
           category: trivy-release
 
-  publish_image:
-    name: "Publish image"
-    needs: [resolve, verify, scan]
+  # Packages only. Nothing reaches a registry before the gate — a chart at the
+  # version number is exactly as pullable as an image at it.
+  publish_chart:
+    name: "Package the chart"
+    needs: [resolve, security_preflight, verify, workflow_scan, integration_check, scan]
     if: |
       always() &&
       needs.resolve.result == 'success' &&
       needs.verify.result == 'success' &&
+      needs.workflow_scan.result == 'success' &&
+      needs.integration_check.result == 'success' &&
+      (needs.security_preflight.result == 'success' || needs.security_preflight.result == 'skipped') &&
       (needs.scan.result == 'success' || needs.scan.result == 'skipped')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Package the chart
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm package charts/cert-manager-webhook-freemyip \
+            --version "$VERSION" \
+            --app-version "$VERSION"
+
+      # Kept for inspection only. The chart that is published is packaged again
+      # after the image is pushed, pinned to its digest, by publish_chart_oci.
+      - name: Keep the pre-approval package for inspection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chart
+          path: cert-manager-webhook-freemyip-*.tgz
+          if-no-files-found: error
+
+  # Aggregate every gate and publish job before the release is announced, so a
+  # partial publish never gets a GitHub release attached to it.
+  release_gate:
+    name: "Release gate"
+    needs: [resolve, security_preflight, verify, workflow_scan, integration_check, scan, publish_chart]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Check every gate and publish job
+        env:
+          # Through env, never interpolated into the shell: an expansion
+          # inside a run block is a code-injection sink.
+          REQUIRED: >-
+            ${{ needs.resolve.result }} ${{ needs.verify.result }}
+            ${{ needs.workflow_scan.result }} ${{ needs.integration_check.result }}
+            ${{ needs.publish_chart.result }}
+          OPTIONAL: >-
+            ${{ needs.scan.result }} ${{ needs.security_preflight.result }}
+        run: |
+          echo "required: $REQUIRED"
+          echo "optional: $OPTIONAL"
+          for r in $REQUIRED; do
+            [ "$r" = "success" ] || { echo "::error::release blocked: a required job did not succeed"; exit 1; }
+          done
+          # These two are the only jobs allowed to be skipped: scan via
+          # skip_security_scan, and the preflight because it never blocks.
+          for r in $OPTIONAL; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::release blocked: a gate job failed"; exit 1 ;;
+            esac
+          done
+          echo "all gates passed"
+
+      # Fail closed if the approval environment is not actually protected.
+      # GitHub creates a missing environment silently, with no rules, the first
+      # time a job names one — so a typo here, or this workflow running in a
+      # fork or a fresh clone, would publish a release with nobody approving
+      # anything. The approval job existing is not the same as it asking.
+      - name: Verify the approval environment requires a reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          n=$(gh api "repos/${REPO}/environments/release-approval" \
+                --jq '[.protection_rules[]? | select(.type=="required_reviewers")] | length' 2>/dev/null) || n=""
+          if [ -z "$n" ]; then
+            echo "::error::cannot read the release-approval environment. Create it with at least one required reviewer before releasing."
+            exit 1
+          fi
+          if [ "$n" = "0" ]; then
+            echo "::error::release-approval has no required reviewer, so the approval below would be granted automatically. Add one."
+            exit 1
+          fi
+          echo "release-approval requires ${n} reviewer(s)"
+
+  # THE approval, and the only one on a successful release.
+  #
+  # It holds no secrets, runs no registry command and writes nothing. Its whole
+  # job is to be the thing GitHub asks about, before anything exists to undo.
+  # Reject it and both registries, gh-pages and the release list are untouched.
+  #
+  # It sits in its own environment rather than `release` because GitHub prompts
+  # per *job*, and every publishing job needs `release` to read the Docker Hub
+  # token. With the reviewer on `release` itself, each of those jobs asked
+  # separately — seven clicks for one decision. The reviewer moves here; the
+  # token stays there; and nothing can reach the token except through this job,
+  # which release_gate has just proved is actually protected.
+  release_approval:
+    name: "⚠️ Approve to PUBLISH — nothing has been written yet"
+    needs: [resolve, release_gate]
+    if: always() && needs.release_gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Record the decision
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          {
+            echo "## Approved: publishing ${VERSION}"
+            echo ""
+            echo "Publication order from here, each step reachable only through this one:"
+            echo ""
+            echo "1. the image, by digest, on ghcr and Docker Hub — no Docker Hub tag yet"
+            echo "2. the chart on the OCI registry, pinned to that digest"
+            echo "3. the chart repository index on gh-pages"
+            echo "4. the GitHub release and the \`v${VERSION}\` tag, with the vulnerability scan in its notes"
+            echo "5. \`latest\`, then the Docker Hub page and the CVE issues"
+            echo "6. **commit:** the Docker Hub version tag — immutable, so it comes last"
+            echo ""
+            echo "Anything failing before step 6 is rolled back further down this same run,"
+            echo "behind its own approval. Nothing irreversible exists until step 6 succeeds."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The first write of the release: the image, pushed by digest.
+  #
+  # To ghcr and to Docker Hub, but with NO Docker Hub version tag. Docker Hub
+  # version tags are immutable — once created they can be neither overwritten
+  # nor deleted — so creating one here would make every later failure
+  # permanent. Content pushed by digest is present but unnamed: nothing
+  # resolves it unless handed the digest, and everything this release publishes
+  # hands out exactly that digest. The version tag is created by commit_tag,
+  # the last job, once every other write has succeeded — so the tag and the
+  # release's metadata succeed together or not at all.
+  #
+  # ghcr does get its version tag here: ghcr tags are deletable, so a failure
+  # later can take it back.
+  #
+  # `scan` already builds this same image locally (load, never push) and fails
+  # the run before the approval is offered, so nothing is lost by building late.
+  #
+  # pull + no-cache: a published image is built from scratch against a freshly
+  # pulled base, never from a layer cache of unknown age.
+  publish_image:
+    name: "Push the image by digest"
+    needs: [resolve, release_approval]
+    if: always() && needs.release_approval.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: release
     permissions:
       contents: read
@@ -181,7 +784,14 @@ jobs:
       "id-token": write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      # The cleanup keys off this. It is set immediately before the push, so it
+      # means "a version tag may exist on Docker Hub" — the one artefact a retry
+      # cannot overwrite.
+      push_attempted: ${{ steps.mark.outputs.attempted }}
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -200,24 +810,50 @@ jobs:
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-        run: printf '%s' "$HUB_PAT" | docker login docker.io -u "$HUB_USER" --password-stdin
+        run: |
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
+            exit 1
+          fi
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
 
-      # latest moves only here, in a reviewer-gated release — never from CI.
-      - name: Build and push
+      # Set before the push, not after. buildx writes the tags itself, and a
+      # failure part-way can still leave a Docker Hub version tag behind;
+      # claiming nothing was pushed would silence the cleanup on exactly the
+      # run that needs it.
+      - name: Record that a version tag is about to exist
+        id: mark
+        run: echo "attempted=true" >> "$GITHUB_OUTPUT"
+
+      # push-by-digest writes the index and its manifests to both registries
+      # without creating any tag — the pattern Docker documents for builds that
+      # are tagged later. name-canonical keeps the reference fully qualified.
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          pull: true
+          no-cache: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
-            ${{ needs.resolve.outputs.ghcr_image }}:latest
-            ${{ needs.resolve.outputs.hub_image }}:${{ needs.resolve.outputs.version }}
-            ${{ needs.resolve.outputs.hub_image }}:latest
+          outputs: type=image,"name=${{ needs.resolve.outputs.ghcr_image }},${{ needs.resolve.outputs.hub_image }}",push-by-digest=true,name-canonical=true,push=true
 
+      # ghcr only. Deletable, so it can be taken back if the release fails.
+      - name: Tag the ghcr copy
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools create --tag "${GHCR_IMAGE}:${VERSION}" "${GHCR_IMAGE}@${DIGEST}"
+
+      # One digest recorded under both names, so verification succeeds whichever
+      # registry the image was pulled from.
       - name: Attest the ghcr image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -232,47 +868,472 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: false
 
-  publish_chart:
-    name: "Publish chart"
-    needs: [resolve, publish_image]
+      # The build action reports the digest it pushed; it does not prove either
+      # registry now serves it. ghcr must serve it under the version tag, Docker
+      # Hub under the digest — and Docker Hub must NOT yet have the version tag,
+      # because that belongs to commit_tag and only commit_tag.
+      - name: Verify what each registry now serves
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          at() { docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'; }
+          [ "$(at "${GHCR_IMAGE}:${VERSION}")" = "$DIGEST" ] \
+            || { echo "::error::${GHCR_IMAGE}:${VERSION} does not resolve to ${DIGEST}"; exit 1; }
+          [ "$(at "${HUB_IMAGE}@${DIGEST}")" = "$DIGEST" ] \
+            || { echo "::error::Docker Hub does not serve ${DIGEST}"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/")
+          [ "$code" = "404" ] \
+            || { echo "::error::${HUB_REPO}:${VERSION} already exists (HTTP ${code}) — only commit_tag may create it"; exit 1; }
+          echo "ghcr:${VERSION} and Docker Hub@digest serve ${DIGEST}; Docker Hub has no version tag yet"
+
+  # The chart on the OCI registry — an install route, so it is published only
+  # once the image exists, and it pins that image by digest. Every install
+  # route therefore works before the Docker Hub version tag exists, which is
+  # what lets that tag be the last write of the release.
+  #
+  # Packaged here rather than taken from before the gate: the digest only
+  # exists once publish_image has run. This one file is also what the GitHub
+  # release attaches, so every route serves byte-identical chart content.
+  publish_chart_oci:
+    name: "Publish the chart to the OCI registry"
+    needs: [resolve, release_approval, publish_image]
+    if: |
+      always() && needs.release_approval.result == 'success' &&
+      needs.publish_image.result == 'success'
     runs-on: ubuntu-latest
-    environment: release
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Package and push the chart
+      - name: Pin the chart to the published digest and package it
+        env:
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
+          # One line, in place. yq would re-serialise the whole file — dropping
+          # blank lines and re-indenting comments — so `helm show values` would
+          # show users a file that differs from the source in more than the pin.
+          v=charts/cert-manager-webhook-freemyip/values.yaml
+          [ "$(grep -c '^  digest: ""$' "$v")" = "1" ] \
+            || { echo "::error::expected exactly one empty image.digest line in ${v}"; exit 1; }
+          sed -i "s|^  digest: \"\"\$|  digest: \"${DIGEST}\"|" "$v"
+          [ "$(yq -r '.image.digest' "$v")" = "$DIGEST" ] \
+            || { echo "::error::image.digest was not pinned to ${DIGEST}"; exit 1; }
+          helm package charts/cert-manager-webhook-freemyip \
+            --version "$VERSION" --app-version "$VERSION"
+
+      - name: Push the packaged chart
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           CHARTS: ${{ needs.resolve.outputs.charts }}
         run: |
+          set -euo pipefail
           printf '%s' "$GHCR_PAT" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
-          helm package charts/cert-manager-webhook-freemyip \
-            --version "$VERSION" \
-            --app-version "$VERSION"
           helm push "cert-manager-webhook-freemyip-${VERSION}.tgz" "$CHARTS"
+
+      # `helm push` exiting 0 says the upload was accepted, not that the
+      # registry will serve this version to an install. Pulled back and read.
+      - name: Verify the OCI registry serves this chart
+        env:
+          CHARTS: ${{ needs.resolve.outputs.charts }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/oci && mkdir -p /tmp/oci
+          helm pull "${CHARTS}/cert-manager-webhook-freemyip" --version "$VERSION" -d /tmp/oci
+          f="/tmp/oci/cert-manager-webhook-freemyip-${VERSION}.tgz"
+          [ -f "$f" ] || { echo "::error::helm pull returned no chart for ${VERSION} from ${CHARTS}"; exit 1; }
+          got_v=$(tar -xzOf "$f" cert-manager-webhook-freemyip/Chart.yaml | yq -r '.version')
+          got_av=$(tar -xzOf "$f" cert-manager-webhook-freemyip/Chart.yaml | yq -r '.appVersion')
+          got_img=$(tar -xzOf "$f" cert-manager-webhook-freemyip/values.yaml | yq -r '.image.repository')
+          got_dg=$(tar -xzOf "$f" cert-manager-webhook-freemyip/values.yaml | yq -r '.image.digest')
+          fail=0
+          [ "$got_v" = "$VERSION" ]     || { echo "::error::OCI chart is version ${got_v}, expected ${VERSION}"; fail=1; }
+          [ "$got_av" = "$VERSION" ]    || { echo "::error::OCI chart has appVersion ${got_av}, expected ${VERSION}"; fail=1; }
+          [ "$got_img" = "$HUB_IMAGE" ] || { echo "::error::OCI chart points at ${got_img}, expected ${HUB_IMAGE}"; fail=1; }
+          [ "$got_dg" = "$DIGEST" ]     || { echo "::error::OCI chart pins ${got_dg}, expected ${DIGEST}"; fail=1; }
+          [ "$fail" = "0" ] || exit 1
+          echo "${CHARTS} serves ${VERSION}, pinned to ${got_img}@${got_dg}"
 
       - name: Keep the packaged chart for the release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: chart
+          name: chart-release
           path: cert-manager-webhook-freemyip-*.tgz
+          if-no-files-found: error
+
+  # The chart repository index, last of the three publishes: it advertises a
+  # version, so the image and the OCI chart must already be there or a
+  # `helm install` from it fails to pull.
+  #
+  # packages_with_index puts the .tgz on the publishing branch beside
+  # index.yaml, so the index serves files from the branch rather than from
+  # release assets. It also implies --skip-existing, so a retry no longer trips
+  # over a release left behind by a failed attempt.
+  #
+  # It does NOT stop the action creating a release of its own: cr upload runs
+  # regardless, so each version gets both `v<version>` from github_release and
+  # `cert-manager-webhook-freemyip-<version>` from here. Suppressing that would
+  # mean owning the index commit and push ourselves, which needs a credential
+  # decision on a checkout that deliberately keeps none.
+  publish_chart_index:
+    name: "Publish the chart repository index"
+    needs: [resolve, release_approval, publish_image, publish_chart_oci]
+    if: |
+      always() && needs.release_approval.result == 'success' &&
+      needs.publish_image.result == 'success' &&
+      needs.publish_chart_oci.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Fatal now. This used to skip with a warning so a repository not yet set
+      # up for Pages could still release. Pages is set up, and the chart
+      # repository is one of the install routes the Docker Hub tag is bound to —
+      # committing the tag without it would publish a release `helm repo add`
+      # users cannot see. `present` stays so the steps below read the same.
+      - name: Check for the gh-pages branch
+        id: pages
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no gh-pages branch — the chart repository cannot be published, so the release stops here and rolls back. Create the branch and enable Pages."
+            exit 1
+          fi
+
+      # chart-releaser commits the index, so git needs an identity. Attributed
+      # to the bot: these are machine-generated commits and do not belong in a
+      # person's contribution history.
+      - name: Give git an identity for the index commit
+        if: steps.pages.outputs.present == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # chart-releaser packages from the checkout, so the version and the digest
+      # are stamped into the checkout — the same values the OCI chart carries.
+      # `helm package --version` does this for the OCI chart; chart-releaser has
+      # no such option, so Chart.yaml itself is set.
+      - name: Stamp the chart with the release version and digest
+        if: steps.pages.outputs.present == 'true'
+        env:
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          c=charts/cert-manager-webhook-freemyip/Chart.yaml
+          for key in version appVersion; do
+            [ "$(grep -c "^${key}:" "$c")" = "1" ] \
+              || { echo "::error::expected exactly one ${key}: line in ${c}"; exit 1; }
+          done
+          sed -i -E "s|^version:.*$|version: ${VERSION}|; s|^appVersion:.*$|appVersion: \"${VERSION}\"|" "$c"
+          if [ "$(yq -r '.version' "$c")" != "$VERSION" ] || [ "$(yq -r '.appVersion' "$c")" != "$VERSION" ]; then
+            echo "::error::Chart.yaml was not stamped with ${VERSION}"
+            exit 1
+          fi
+
+          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::'${DIGEST}' is not a sha256 digest"; exit 1; }
+          # One line, in place. yq would re-serialise the whole file — dropping
+          # blank lines and re-indenting comments — so `helm show values` would
+          # show users a file that differs from the source in more than the pin.
+          v=charts/cert-manager-webhook-freemyip/values.yaml
+          [ "$(grep -c '^  digest: ""$' "$v")" = "1" ] \
+            || { echo "::error::expected exactly one empty image.digest line in ${v}"; exit 1; }
+          sed -i "s|^  digest: \"\"\$|  digest: \"${DIGEST}\"|" "$v"
+          [ "$(yq -r '.image.digest' "$v")" = "$DIGEST" ] \
+            || { echo "::error::image.digest was not pinned to ${DIGEST}"; exit 1; }
+
+      - name: Publish to the GitHub Pages chart repository
+        if: steps.pages.outputs.present == 'true'
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          charts_dir: charts
+          packages_with_index: true
+
+      # The action above can report success without publishing anything: it
+      # skips silently when charts/ is unchanged since the last tag, and its
+      # index step is skipped entirely by some input combinations. Both leave a
+      # green job whose name promises an index that nobody updated — and
+      # the publish jobs after it all key off that success. So the
+      # index is read back and checked to actually advertise this version.
+      # Checked the way a user would experience it, not by grepping for the
+      # version string. A string appearing in index.yaml proves nothing about
+      # what `helm install` would actually get: the entry has to be reachable,
+      # the file it names has to download, and the chart inside it has to be
+      # this version pointing at the image this release just published.
+      #
+      # Three separate faults have hidden behind a weaker check — chart-releaser
+      # skipping silently, the index never being written, and an entry surviving
+      # from an earlier run — and every one of them leaves the version string
+      # present.
+      - name: Verify the chart repository serves this release
+        if: steps.pages.outputs.present == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          PAGES: https://${{ github.repository_owner }}.github.io/cert-manager-webhook-freemyip
+        run: |
+          set -euo pipefail
+          command -v yq >/dev/null 2>&1 || { echo "::error::yq is not available on this runner"; exit 1; }
+
+          # 1 and 2. the index is fetchable over the URL `helm repo add` is given,
+          #    and it has an entry for this version that names a file.
+          #
+          # Polled, bounded, not checked once. GitHub Pages republishes the
+          # branch asynchronously after the push: the first 0.1.1 attempt read
+          # the index one second after the commit, while the Pages build was
+          # still starting (it took 47s), saw the previous site and failed a
+          # release that had published correctly. The query string defeats the
+          # Pages CDN cache, which would otherwise serve the old file for up to
+          # ten minutes after the build.
+          deadline=$(( $(date +%s) + 600 ))
+          url=""
+          while :; do
+            if curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+                 "${PAGES}/index.yaml?release=${VERSION}&t=$(date +%s)" -o index.yaml; then
+              url=$(V="$VERSION" yq -r \
+                '.entries["cert-manager-webhook-freemyip"][] | select(.version == strenv(V)) | .urls[0] // ""' \
+                index.yaml)
+              [ -n "$url" ] && break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::after 10 minutes ${PAGES}/index.yaml still has no entry for ${VERSION}. The chart repository was not updated, so helm repo add users would not see this release."
+              exit 1
+            fi
+            echo "Pages does not serve ${VERSION} yet — waiting for the site to republish"
+            sleep 15
+          done
+          echo "Pages serves ${VERSION}"
+          case "$url" in
+            http*) full="$url" ;;
+            *)     full="${PAGES}/${url}" ;;
+          esac
+
+          # 3. that file downloads
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 "$full" -o chart.tgz \
+            || { echo "::error::the index advertises ${full}, which does not download. Every helm install would fail at fetch."; exit 1; }
+
+          # 4. and it is *our* chart, at this version, pointing at the image
+          #    this run published. Read straight out of the archive so this
+          #    needs no helm on the runner.
+          got_v=$(tar -xzOf chart.tgz cert-manager-webhook-freemyip/Chart.yaml \
+                  | yq -r '.version')
+          got_av=$(tar -xzOf chart.tgz cert-manager-webhook-freemyip/Chart.yaml \
+                  | yq -r '.appVersion')
+          got_img=$(tar -xzOf chart.tgz cert-manager-webhook-freemyip/values.yaml \
+                  | yq -r '.image.repository')
+          fail=0
+          [ "$got_v" = "$VERSION" ]   || { echo "::error::the published chart is version ${got_v}, expected ${VERSION}"; fail=1; }
+          [ "$got_av" = "$VERSION" ]  || { echo "::error::the published chart has appVersion ${got_av}, expected ${VERSION} — it would pull the wrong image"; fail=1; }
+          [ "$got_img" = "$HUB_IMAGE" ] || { echo "::error::the published chart points at ${got_img}, expected ${HUB_IMAGE}"; fail=1; }
+          got_dg=$(tar -xzOf chart.tgz cert-manager-webhook-freemyip/values.yaml | yq -r '.image.digest')
+          [ "$got_dg" = "$DIGEST" ] || { echo "::error::the published chart pins ${got_dg}, expected ${DIGEST}"; fail=1; }
+          [ "$fail" = "0" ] || exit 1
+
+          echo "${PAGES} serves ${VERSION}: chart ${got_v}, appVersion ${got_av}, image ${got_img}"
+
+      # The chart repository is also a public web page, and the page describes
+      # what the release serves. It is published from docs/pages/ so it goes
+      # through review like everything else, and so a hand edit on the branch
+      # cannot quietly become the only copy.
+      #
+      # Written through the contents API rather than a push: the checkout above
+      # keeps no credentials on purpose, and chart-releaser owns the commit
+      # before this one, so pushing a second commit from the same shell would
+      # mean holding a pushable credential to race it.
+      - name: Publish the page sources
+        if: steps.pages.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          changed=0
+          for src in docs/pages/*; do
+            name=$(basename "$src")
+            # The directory's own README explains the directory, not the site.
+            [ "$name" = "README.md" ] && continue
+            local_b64=$(base64 < "$src" | tr -d '\n')
+            # Exit status, not output: on an error gh prints the error body to stdout.
+            if remote_b64=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.content' 2>/dev/null); then
+              remote_b64=$(printf '%s' "$remote_b64" | tr -d '\n')
+            else
+              remote_b64=""
+            fi
+            # The API returns base64 wrapped at 60 columns; compare the decoded
+            # bytes so re-wrapping alone never looks like a change.
+            if [ -n "$remote_b64" ] \
+               && [ "$(printf '%s' "$remote_b64" | base64 -d | sha256sum | cut -d' ' -f1)" \
+                  = "$(sha256sum < "$src" | cut -d' ' -f1)" ]; then
+              echo "${name} unchanged"
+              continue
+            fi
+            # Fatal, not a warning. The pages are part of the release's metadata,
+            # and the Docker Hub version tag is only committed once all of that
+            # succeeded — a page that silently failed to publish would let an
+            # immutable tag be committed alongside a stale page.
+            sha=$(gh api "repos/${REPO}/contents/${name}?ref=gh-pages" --jq '.sha' 2>/dev/null) || sha=""
+            if [ -n "$sha" ]; then
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Update ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f sha="$sha" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not update ${name} on gh-pages"
+                exit 1
+              fi
+              echo "updated ${name}"
+            else
+              if ! gh api -X PUT "repos/${REPO}/contents/${name}" \
+                     -f message="Add ${name} for ${VERSION}" \
+                     -f content="$local_b64" -f branch=gh-pages >/dev/null; then
+                echo "::error::could not add ${name} to gh-pages"
+                exit 1
+              fi
+              echo "added ${name}"
+            fi
+            changed=1
+          done
+          if [ "$changed" = "0" ]; then
+            echo "page sources already current"
+          fi
+
+  # Scan what was actually published, not what was built. The image on the
+  # registry is the one people pull, and advisories land after a release as
+  # often as before one.
+  #
+  # Before the GitHub release, because the scan is part of its notes. The notes
+  # are where the scan lives: each release carries its own, the previous release
+  # keeps its own, and a withdrawn release takes its scan with it. Nothing is
+  # committed to the default branch, which the branch ruleset rightly refuses to
+  # a workflow.
+  scan_published:
+    name: "Scan the published image"
+    needs: [resolve, release_approval, publish_image]
+    if: always() && needs.release_approval.result == 'success' && needs.publish_image.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Read only, apart from the code-scanning upload. This job runs a
+      # third-party scanner and renders attacker-influenceable strings (package
+      # names and CVE text out of somebody else's advisory database) into
+      # markdown. It must not also hold a token that can change the repository.
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan the released image
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-released.sarif
+          exit-code: 0
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@cb06a0a8527b2c6970741b3a0baa15231dc74a4c # v4.34.1
+        with:
+          sarif_file: trivy-released.sarif
+          category: trivy-released
+
+      # Every severity, not only the blocking ones. A table that quietly
+      # omitted MEDIUM would be a more misleading number than no table at all.
+      # The CVE issues still filter to CRITICAL and HIGH themselves.
+      - name: Scan again as JSON, all severities
+        uses: lhotari/sandboxed-trivy-action@f01374b6cc3bf7264ab238293e94f6db7ada6dd0 # v1.0.2
+        with:
+          scan-ref: ${{ needs.resolve.outputs.ghcr_image }}:${{ needs.resolve.outputs.version }}
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          trivyignores: .trivyignore
+          format: json
+          output: trivy-released.json
+          exit-code: 0
+
+      # Docker Hub scans one repository per account, so the scan its page would
+      # otherwise show is information this project loses. Rendered from our own
+      # scan of the image that was actually published, once, and used as is by
+      # the release notes and the Docker Hub page, so the two cannot disagree.
+      - name: Render the scan
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/render_scan.sh trivy-released.json \
+            "${HUB_IMAGE}:${VERSION}" "$(date -u +%Y-%m-%d)" > scan.md
+          cat scan.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the scan on
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan
+          path: |
+            scan.md
+            trivy-released.json
           if-no-files-found: error
 
   github_release:
     name: "Create GitHub release"
-    needs: [resolve, publish_image, publish_chart]
+    # Announced once the image, the OCI chart and the index all serve this
+    # version, so the release list never points at something not yet published.
+    needs: [resolve, release_approval, publish_image, publish_chart_oci, publish_chart_index, scan_published]
+    if: |
+      always() && needs.release_approval.result == 'success' &&
+      needs.publish_image.result == 'success' &&
+      needs.publish_chart_oci.result == 'success' &&
+      needs.publish_chart_index.result == 'success' &&
+      needs.scan_published.result == 'success'
     runs-on: ubuntu-latest
-    environment: release
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -280,7 +1341,47 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: chart
+          name: chart-release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan
+
+      # The notes: the text given at dispatch, then the changes since the last
+      # release, then the scan between its markers. The scan goes in through
+      # apply_scan.sh, which refuses markup, markers and unsafe links a second
+      # time. The notes must hold exactly one marker pair: that is how a
+      # withdrawal finds the live release's scan again, and a pull request title
+      # carrying a marker must not be able to move it.
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+          OVERRIDE: ${{ inputs.override_notes }}
+        run: |
+          set -uo pipefail
+          generated=""
+          if [ "$OVERRIDE" != "true" ]; then
+            # v* only. chart-releaser tags cert-manager-webhook-freemyip-<version>
+            # minutes earlier in this run; taken as "previous", it would leave
+            # the generated notes covering an empty range.
+            prev=$(git tag --sort=-creatordate --list 'v*' | grep -vxF "$TAG" | head -1)
+            args=(-f tag_name="$TAG")
+            if [ -n "$prev" ]; then args+=(-f previous_tag_name="$prev"); fi
+            generated=$(gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq '.body') \
+              || { echo "::error::could not generate the release notes"; exit 1; }
+          fi
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            if [ -n "$generated" ]; then printf '%s\n\n' "$generated"; fi
+            printf '%s\n%s\n' '<!-- scan:begin -->' '<!-- scan:end -->'
+          } > notes.md
+          for m in 'scan:begin' 'scan:end'; do
+            [ "$(grep -c "$m" notes.md)" = "1" ] \
+              || { echo "::error::the release notes carry a second ${m} marker; remove it from the notes text or the pull request title"; exit 1; }
+          done
+          ./scripts/apply_scan.sh scan.md notes.md || exit 1
 
       # gh release create makes the tag, so nothing pushes a ref before the
       # artifacts are actually published.
@@ -288,60 +1389,663 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.resolve.outputs.tag }}
-          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --latest \
+            cert-manager-webhook-freemyip-*.tgz
+
+      # A release that is a draft, lacks its chart, or does not carry the scan
+      # is a dead install route or a missing statement that every later job
+      # would go on to advertise.
+      - name: Verify the release is published with its chart and scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          json=$(gh release view "$TAG" --repo "$REPO" --json isDraft,assets,body) \
+            || { echo "::error::release ${TAG} does not exist after creating it"; exit 1; }
+          [ "$(printf '%s' "$json" | jq -r '.isDraft')" = "false" ] \
+            || { echo "::error::release ${TAG} is a draft — nobody can download it"; exit 1; }
+          want="cert-manager-webhook-freemyip-${VERSION}.tgz"
+          printf '%s' "$json" | jq -e --arg a "$want" '.assets | map(.name) | index($a) != null' >/dev/null \
+            || { echo "::error::release ${TAG} does not carry ${want}"; exit 1; }
+          block() { awk 'index($0,"<!-- scan:end -->"){f=0} f{print} index($0,"<!-- scan:begin -->"){f=1}'; }
+          printf '%s\n' "$(printf '%s' "$json" | jq -r '.body')" | block > got-scan.md
+          if ! diff -q scan.md got-scan.md >/dev/null; then
+            echo "::error::the notes of ${TAG} do not carry the scan this run rendered"
+            exit 1
+          fi
+          echo "release ${TAG} is published, carries ${want} and the scan"
+
+      - name: Summarise
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
           GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
           HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          set -euo pipefail
-          if [ -n "$NOTES" ]; then
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          else
-            gh release create "$TAG" --title "$TAG" --generate-notes --latest \
-              cert-manager-webhook-freemyip-*.tgz
-          fi
           {
             echo "### Released ${TAG}"
             echo ""
             echo "- \`${GHCR_IMAGE}:${VERSION}\`"
-            echo "- \`${HUB_IMAGE}:${VERSION}\`"
+            echo "- \`${HUB_IMAGE}:${VERSION}\` (the tag is committed last)"
             echo "- chart \`${VERSION}\` pushed to the ghcr OCI registry"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  cleanup_on_cancel:
-    name: "⚠️ Approve to DELETE partially published tags — NOT a release"
-    needs: [resolve]
-    if: cancelled()
+  # The only mutable pointer in the release.
+  #
+  # By the time this runs, all three install routes and the release list already
+  # serve this version, so `latest` never points at something nothing else
+  # advertises.
+  #
+  # imagetools create copies the manifest list by digest rather than rebuilding,
+  # so `latest` is byte-for-byte the image that was scanned, attested and
+  # published, and the attestation still resolves.
+  promote_latest:
+    name: "Move latest to the released version"
+    needs: [resolve, release_approval, publish_image, github_release]
+    if: |
+      always() && needs.release_approval.result == 'success' &&
+      needs.publish_image.result == 'success' &&
+      needs.github_release.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: release
+    permissions:
+      contents: read
+      packages: write
     steps:
-      # Docker Hub publishes tag by tag, so a cancel mid-push can leave a
-      # half-released version behind. ghcr is not cleaned up here: its
-      # versioned tags are overwritable, so a retry corrects them.
-      - name: Delete the tags this run may have pushed
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to ghcr.io
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Log in to Docker Hub
         env:
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
-          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
-          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          set -uo pipefail
-          if [ -z "${VERSION:-}" ]; then
-            echo "no version resolved — nothing this run could have pushed"
-            exit 0
-          fi
-          jwt=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PAT}\"}" \
-            | grep -o '"token":"[^"]*"' | sed 's/"token":"//; s/"//')
-          if [ -z "$jwt" ]; then
-            echo "could not authenticate to the Docker Hub API — delete the tags by hand"
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
             exit 1
           fi
-          for tag in "$VERSION" latest; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-              "https://hub.docker.com/v2/repositories/${HUB_IMAGE}/tags/${tag}/" \
-              -H "Authorization: Bearer ${jwt}")
-            echo "delete ${HUB_IMAGE}:${tag} -> ${code}"
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
+
+      # ghcr first: its tags are overwritable, so a failure between the two
+      # leaves the recoverable registry moved and the one with immutable version
+      # tags untouched.
+      - name: Point latest at the released version
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${GHCR_IMAGE}:latest" "${GHCR_IMAGE}@${DIGEST}"
+          docker buildx imagetools create --tag "${HUB_IMAGE}:latest"  "${HUB_IMAGE}@${DIGEST}"
+          echo "latest now points at ${VERSION} on both registries"
+
+      # Read back on both registries: success has to mean the pointer moved.
+      - name: Verify latest resolves to the released digest
+        env:
+          GHCR_IMAGE: ${{ needs.resolve.outputs.ghcr_image }}
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for img in "$GHCR_IMAGE" "$HUB_IMAGE"; do
+            l=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${img}:latest")
+            if [ "$DIGEST" != "$l" ]; then
+              echo "::error::${img}:latest resolves to ${l}, expected ${DIGEST} (${VERSION})"
+              exit 1
+            fi
+            echo "${img}:latest -> ${l}"
           done
+
+  # The Docker Hub page: the page source with this release's scan, composed here
+  # from the same scan.md the release notes carry. A top-level job, not a call to
+  # another workflow: a called workflow's job never received its environment's
+  # secrets. The account password reaches a script in this repository and no
+  # third-party action.
+  dockerhub_description:
+    name: "Refresh the Docker Hub page"
+    needs: [resolve, release_approval, promote_latest, scan_published]
+    if: |
+      always() && needs.promote_latest.result == 'success' &&
+      needs.scan_published.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan
+      - name: Compose the page
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp docs/dockerhub_description.md page.md
+          ./scripts/apply_scan.sh scan.md page.md
+          grep -qF ":${VERSION}\`," page.md \
+            || { echo "::error::the composed page does not name ${VERSION}"; exit 1; }
+      - name: Publish the page and read it back
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/dockerhub_page.sh "$HUB_REPO" page.md
+
+  # One issue per CVE, not one issue listing them all: a lumped issue is never
+  # closed cleanly and stops being read. Matches how docker-nginx-lego tracks
+  # them. Separate from the scan, so the job running a third-party scanner holds
+  # no write access to issues, and after latest, so the list describes a release
+  # users can already pull.
+  record_cves:
+    name: "Open or update an issue per CVE"
+    needs: [resolve, release_approval, promote_latest, scan_published]
+    if: |
+      always() && needs.promote_latest.result == 'success' &&
+      needs.scan_published.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scan
+      - name: Open or update an issue per CVE
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          # SC2016: the single-quoted blocks below are jq programs, and $cve is a
+          # jq variable bound with --arg. Shell expansion is exactly what must
+          # not happen there.
+          set -uo pipefail
+          today=$(date +%Y-%m-%d)
+
+          cves=$(jq -r '.Results[]?.Vulnerabilities[]? |
+            select(.Severity == "CRITICAL" or .Severity == "HIGH") |
+            .VulnerabilityID' trivy-released.json 2>/dev/null | sort -u)
+
+          if [ -z "$cves" ]; then
+            echo "No CRITICAL or HIGH findings in the released image." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Fatal, like every other write before the Docker Hub tag is committed:
+          # the issues are part of the CVE list this release publishes.
+          open_issues=$(gh issue list --repo "$REPO" --label security --state open \
+            --json number,title --limit 100) \
+            || { echo "::error::cannot list the open security issues"; exit 1; }
+
+          failed=0
+          while read -r cve; do
+            [ -z "$cve" ] && continue
+            row=$(jq -r --arg cve "$cve" '
+              .Results[]?.Vulnerabilities[]? |
+              select(.VulnerabilityID == $cve) |
+              "\(.Severity)\t\(.PkgName)\t\(.FixedVersion // "unknown")"
+            ' trivy-released.json | head -1)
+            [ -z "$row" ] && continue
+            severity=$(printf '%s' "$row" | cut -f1)
+            pkg=$(printf '%s' "$row" | cut -f2)
+            fixed=$(printf '%s' "$row" | cut -f3)
+
+            labels="security,severity:$(printf '%s' "$severity" | tr '[:upper:]' '[:lower:]')"
+            [ "$fixed" = "unknown" ] && labels="${labels},no-fix-available"
+
+            existing=$(printf '%s' "$open_issues" | jq -r --arg cve "$cve" \
+              '.[] | select(.title | contains($cve)) | .number' | head -1)
+
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" \
+                --body "Still present in release \`${TAG}\` (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`." \
+                || { echo "::error::could not comment on #${existing} for ${cve}"; failed=1; }
+            else
+              body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**Detected in release:** `%s`\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
+                "$cve" "$severity" "$pkg" "$fixed" "$TAG" "$cve")
+              gh issue create --repo "$REPO" \
+                --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
+                --body "$body" --label "$labels" \
+                || { echo "::error::could not open an issue for ${cve}"; failed=1; }
+            fi
+          done < <(printf '%s\n' "$cves")
+          exit "$failed"
+
+  # THE COMMIT. The Docker Hub version tag, and nothing after it.
+  #
+  # Docker Hub version tags are immutable: once created, neither overwritable nor
+  # deletable. So this is the one write that cannot be taken back, and it runs
+  # only after every other write of the release has succeeded. Until it
+  # succeeds everything is reversible, and the rollback jobs below reverse it;
+  # once it succeeds there is nothing left to fail. The tag and the release's
+  # metadata succeed together or not at all.
+  #
+  # Content is already on Docker Hub by digest, so this writes one small index
+  # manifest and nothing else.
+  commit_tag:
+    name: "Commit: create the Docker Hub version tag"
+    needs: [resolve, publish_image, publish_chart_oci, publish_chart_index, scan_published, github_release, promote_latest, dockerhub_description, record_cves]
+    if: |
+      always() &&
+      needs.publish_image.result == 'success' &&
+      needs.publish_chart_oci.result == 'success' &&
+      needs.publish_chart_index.result == 'success' &&
+      needs.scan_published.result == 'success' &&
+      needs.github_release.result == 'success' &&
+      needs.promote_latest.result == 'success' &&
+      needs.dockerhub_description.result == 'success' &&
+      needs.record_cves.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Docker Hub
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: |
+          user=$(printf '%s' "$HUB_USER" | tr -d '[:space:]')
+          pat=$(printf '%s' "$HUB_PAT" | tr -d '[:space:]')
+          [ "$user" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ] || \
+            echo "::warning::DOCKERHUB_USERNAME contains uppercase. Docker Hub currently requires the lowercase Docker ID; if the login below fails with a malformed authorization header, that is why."
+          if [ -z "$user" ] || [ -z "$pat" ]; then
+            echo "::error::Docker Hub username or token is empty. The username must be the Docker ID, not an email address."
+            exit 1
+          fi
+          printf '%s' "$pat" | docker login docker.io -u "$user" --password-stdin
+
+      # Decided by what Docker Hub serves afterwards, not by the exit status of
+      # the create: a create that reports failure after the tag landed must not
+      # send the release into a rollback that could no longer remove it.
+      - name: Create the version tag on the published digest
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          set -uo pipefail
+          tag_digest() {
+            curl -s --retry 3 --retry-all-errors --max-time 30 \
+              "https://hub.docker.com/v2/repositories/${HUB_REPO}/tags/${VERSION}/" | jq -r '.digest // empty'
+          }
+          have=$(tag_digest)
+          if [ -z "$have" ]; then
+            docker buildx imagetools create --tag "${HUB_IMAGE}:${VERSION}" "${HUB_IMAGE}@${DIGEST}" \
+              || echo "::warning::the create reported failure — checking what Docker Hub now serves"
+            have=$(tag_digest)
+          fi
+          if [ "$have" = "$DIGEST" ]; then
+            echo "committed: ${HUB_IMAGE}:${VERSION} -> ${DIGEST}"
+          elif [ -z "$have" ]; then
+            echo "::error::${HUB_IMAGE}:${VERSION} was not created. Nothing irreversible happened; the rollback below reverts the rest."
+            exit 1
+          else
+            echo "::error::${HUB_IMAGE}:${VERSION} points at ${have}, not ${DIGEST}. Something else created this tag."
+            exit 1
+          fi
+
+      - name: Summarise
+        env:
+          HUB_IMAGE: ${{ needs.resolve.outputs.hub_image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+        run: |
+          {
+            echo "### Committed \`${VERSION}\`"
+            echo ""
+            echo "\`${HUB_IMAGE}:${VERSION}\` now names \`${DIGEST}\`. Every other"
+            echo "part of the release was published and verified before this tag existed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── ROLLBACK ──────────────────────────────────────────────────────────────
+  # A release that fails after its first push and before the commit is undone
+  # here, in this same run, so what went wrong and what was undone are on one
+  # page. The steps are the same scripts the manual "Withdraw a release" uses,
+  # in the same order and under the same credentials, one kind per job.
+  #
+  # rollback_plan lists what exists. rollback_confirm is its own approval, under
+  # release-approval: approving a release is not approving its deletion, so
+  # nothing is removed until the reviewer has seen the list. Every undo job
+  # needs that approval, which validate.sh checks.
+  #
+  # always() lets these run when the release was cancelled as well as when it
+  # failed.
+  rollback_plan:
+    name: "↩ Rollback: what this release left behind"
+    needs: [resolve, publish_image, commit_tag]
+    if: |
+      always() && needs.resolve.result == 'success' &&
+      (needs.publish_image.outputs.push_attempted == 'true' || needs.publish_image.result == 'cancelled') &&
+      needs.commit_tag.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.p.outputs.version }}
+      hub_repo: ${{ steps.p.outputs.hub_repo }}
+      digest: ${{ steps.p.outputs.digest }}
+      prev: ${{ steps.p.outputs.prev }}
+      found: ${{ steps.p.outputs.found }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Find what this release left behind
+        id: p
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.publish_image.outputs.digest }}
+          HUB_REPO: ${{ needs.resolve.outputs.hub_repo }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+        run: ./scripts/withdraw/plan.sh
+
+  rollback_confirm:
+    name: "⚠️ Approve to ROLL BACK everything listed above"
+    needs: [rollback_plan]
+    if: always() && needs.rollback_plan.result == 'success' && needs.rollback_plan.outputs.found == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Record the decision
+        env:
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: echo "rollback of ${VERSION} approved"
+
+  rollback_pages:
+    name: "↩ 0. Roll back the gh-pages page sources"
+    needs: [rollback_plan, rollback_confirm]
+    if: always() && needs.rollback_confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore what this release changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: ./scripts/withdraw/pages.sh
+
+  rollback_hub_page:
+    name: "↩ 0. Roll back the Docker Hub page"
+    needs: [rollback_plan, rollback_confirm, rollback_pages]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_pages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub-metadata
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore the page to the live release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PW: ${{ secrets.DOCKERHUB_PASSWORD }}
+          VCS_URL: https://github.com/${{ github.repository }}
+        run: ./scripts/withdraw/hub_page.sh
+
+  rollback_issues:
+    name: "↩ 0. Roll back the CVE issues"
+    needs: [rollback_plan, rollback_confirm, rollback_hub_page]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_hub_page.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Close or re-point the issues, delete the comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/issues.sh
+
+  rollback_latest:
+    name: "↩ 1. Move latest back"
+    needs: [rollback_plan, rollback_confirm, rollback_issues]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_issues.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Move latest back, or remove it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/latest.sh
+
+  rollback_records:
+    name: "↩ 2. Remove the release, tags and chart index entry"
+    needs: [rollback_plan, rollback_confirm, rollback_latest]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_latest.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the releases and tags, hand back Latest, remove the index entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+        run: ./scripts/withdraw/records.sh
+
+  rollback_packages:
+    name: "↩ 4. Remove the ghcr packages"
+    needs: [rollback_plan, rollback_confirm, rollback_records]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_records.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Delete the chart, then the image, on ghcr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+        run: ./scripts/withdraw/packages.sh
+
+  # The release never creates this tag before the commit, so this normally
+  # finds nothing. It runs anyway: the rollback proves that, rather than
+  # assuming it.
+  rollback_image:
+    name: "↩ 5. Remove the Docker Hub version tag"
+    needs: [rollback_plan, rollback_confirm, rollback_packages]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_packages.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      removed: ${{ steps.i.outputs.removed }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the tag, unless it is immutable
+        id: i
+        env:
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_PAT: ${{ secrets.DOCKERHUB_RELEASE_TOKEN }}
+        run: ./scripts/withdraw/image.sh
+
+  rollback_attestations:
+    name: "↩ 6. Remove the attestation records"
+    needs: [rollback_plan, rollback_confirm, rollback_image]
+    if: always() && needs.rollback_confirm.result == 'success' && needs.rollback_image.result == 'success' && needs.rollback_image.outputs.removed == 'true' && needs.rollback_plan.outputs.digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Delete the attestations for the digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+        run: ./scripts/withdraw/attestations.sh
+
+  # The run stays red either way: the release did not happen. This job's own
+  # result says whether the rollback left anything behind.
+  rollback_verify:
+    name: "↩ Verify: nothing of this release is left"
+    needs: [rollback_plan, rollback_confirm, rollback_pages, rollback_hub_page, rollback_issues, rollback_latest, rollback_records, rollback_packages, rollback_image, rollback_attestations]
+    if: always() && needs.rollback_confirm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      packages: read
+      attestations: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check every location
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          HUB_REPO: ${{ needs.rollback_plan.outputs.hub_repo }}
+          VERSION: ${{ needs.rollback_plan.outputs.version }}
+          PREV: ${{ needs.rollback_plan.outputs.prev }}
+          DIGEST: ${{ needs.rollback_plan.outputs.digest }}
+          HUB_KEPT: ${{ needs.rollback_image.outputs.removed == 'false' }}
+          STEPS: >-
+            pages ${{ needs.rollback_pages.result }}, Docker Hub page ${{ needs.rollback_hub_page.result }},
+            issues ${{ needs.rollback_issues.result }}, latest ${{ needs.rollback_latest.result }},
+            records ${{ needs.rollback_records.result }}, ghcr ${{ needs.rollback_packages.result }},
+            Docker Hub tag ${{ needs.rollback_image.result }}, attestations ${{ needs.rollback_attestations.result }}
+        run: ./scripts/withdraw/verify.sh
