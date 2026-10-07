@@ -2,6 +2,25 @@ apiVersion: v1
 entries:
   cert-manager-webhook-freemyip:
   - apiVersion: v2
+    appVersion: 0.1.2
+    created: "2026-10-07T11:21:30.959880346Z"
+    description: cert-manager ACME DNS-01 webhook solver for freemyip.com
+    digest: 3b5aec47fd160fa9a565369d555022c9f5af0b124d850e9ed34eeb1c98fb0dc1
+    home: https://github.com/emulatorchen/cert-manager-webhook-freemyip
+    icon: https://raw.githubusercontent.com/cert-manager/cert-manager/master/logo/logo.png
+    keywords:
+    - cert-manager
+    - webhook
+    - letsencrypt
+    - tls
+    - freemyip
+    name: cert-manager-webhook-freemyip
+    sources:
+    - https://github.com/emulatorchen/cert-manager-webhook-freemyip
+    urls:
+    - cert-manager-webhook-freemyip-0.1.2.tgz
+    version: 0.1.2
+  - apiVersion: v2
     appVersion: 0.1.1
     created: "2026-09-30T08:53:12.412103219Z"
     description: cert-manager ACME DNS-01 webhook solver for freemyip.com
@@ -39,4 +58,4 @@ entries:
     urls:
     - cert-manager-webhook-freemyip-0.1.0.tgz
     version: 0.1.0
-generated: "2026-09-30T08:53:12.4121142Z"
+generated: "2026-10-07T11:21:30.959894222Z"
