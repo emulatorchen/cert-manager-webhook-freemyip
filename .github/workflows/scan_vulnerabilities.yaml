@@ -194,10 +194,10 @@ jobs:
     if: always() && needs.triage.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # An environment restricted to main, with no reviewer. This workflow is
+    # An environment restricted to the default branch, with no reviewer. This workflow is
     # dispatchable from any branch, so without it anyone with write access could
     # push a branch that alters this job to exfiltrate the token and simply run
-    # it. The branch policy refuses the secret to any ref but main; the weekly
+    # it. The branch policy refuses the secret to any ref but the default branch; the weekly
     # scheduled run is unaffected, because a schedule always runs from the
     # default branch.
     environment: cve-autofix
@@ -372,7 +372,7 @@ jobs:
         uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
         with:
           token: ${{ secrets.CVE_AUTOFIX_TOKEN }}
-          base: main
+          base: ${{ github.event.repository.default_branch }}
           branch: fix/cve-os-packages
           delete-branch: true
           title: "fix: pin OS packages for CVEs from the scheduled scan (${{ steps.fix.outputs.today }})"
