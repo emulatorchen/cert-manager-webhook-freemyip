@@ -3,7 +3,7 @@
 # thing that was scanned and the thing that ships need not be identical.
 # docker-nginx-lego pins the same way, and its version watcher re-resolves the
 # digest whenever it bumps the tag.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:66f9a494af2b76ecb3eab75ff47166df61caec6d200c59d556b77327493d83a8 AS build_deps
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS build_deps
 
 RUN apk add --no-cache git ca-certificates
 
