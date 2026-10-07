@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, master]
 
 # Superseded runs on the same ref are pointless work — cancel them.
 concurrency:
@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 jobs:
-  # Skip the expensive jobs when a change cannot affect them. A push to main
-  # always runs everything, so main is never green on a stale skip.
+  # Skip the expensive jobs when a change cannot affect them. A push to the default branch
+  # always runs everything, so it is never green on a stale skip.
   changes:
     name: "Detect changes"
     runs-on: ubuntu-latest
