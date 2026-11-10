@@ -410,7 +410,7 @@ grep -q FAIL /tmp/_sec.txt && FAIL=1; rm -f /tmp/_sec.txt
 # `release` carries no reviewer of its own — the reviewer sits
 # on release-approval, so one decision covers a whole release instead of one
 # prompt per job. That makes the environment check above necessary but not
-# sufficient: any job on main that declares `environment: release` receives the
+# sufficient: any job on the default branch that declares `environment: release` receives the
 # Docker Hub publish token, approved or not. What has to hold is that every such
 # job is the approval job or descends from it through `needs`.
 #

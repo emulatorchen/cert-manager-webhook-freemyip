@@ -2,9 +2,9 @@ name: codeql
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   schedule:
     # Monday 08:00 UTC — catches advisories published since the last push.
     - cron: "0 8 * * 1"
