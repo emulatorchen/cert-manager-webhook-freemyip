@@ -1365,8 +1365,10 @@ jobs:
           if [ "$OVERRIDE" != "true" ]; then
             # v* only. chart-releaser tags cert-manager-webhook-freemyip-<version>
             # minutes earlier in this run; taken as "previous", it would leave
-            # the generated notes covering an empty range.
-            prev=$(git tag --sort=-creatordate --list 'v*' | grep -vxF "$TAG" | head -1)
+            # the generated notes covering an empty range. On a first release
+            # there is no other v* tag; under bash -e the empty grep would end
+            # the step.
+            prev=$(git tag --sort=-creatordate --list 'v*' | { grep -vxF "$TAG" || true; } | head -1)
             args=(-f tag_name="$TAG")
             if [ -n "$prev" ]; then args+=(-f previous_tag_name="$prev"); fi
             generated=$(gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq '.body') \

@@ -123,63 +123,90 @@ jobs:
           # SC2016: the single-quoted blocks below are jq programs, and $cve and
           # $c are jq variables bound with --arg. Shell expansion is exactly what
           # must not happen there.
+          #
+          # GitHub runs this with bash -e, and pipefail is on, so a grep that
+          # matches nothing ends the step. Every grep below that may legitimately
+          # match nothing is written so that an empty result is not an error:
+          # an open issue list holding only GHSA titles stopped this step, in
+          # silence, every week from 2026-10-05.
           set -uo pipefail
           today=$(date +%Y-%m-%d)
+          id_re='(CVE|GHSA|GO)-[0-9A-Za-z-]+'
 
+          [ -s trivy.json ] || { echo "::error::trivy.json is missing from the scan artifact"; exit 1; }
           cves=$(jq -r '.Results[]?.Vulnerabilities[]? |
             select(.Severity == "CRITICAL" or .Severity == "HIGH") |
-            .VulnerabilityID' trivy.json 2>/dev/null | sort -u)
+            .VulnerabilityID' trivy.json | sort -u) \
+            || { echo "::error::cannot read trivy.json"; exit 1; }
 
+          # Fatal: read as "no open issues", a failed listing would open a
+          # duplicate of every one of them.
           open_issues=$(gh issue list --repo "$REPO" --label security --state open \
-            --json number,title --limit 100 2>/dev/null || echo "[]")
+            --json number,title --limit 200) \
+            || { echo "::error::cannot list the open security issues"; exit 1; }
 
-          # Close first, so an issue for a CVE the base image has since fixed does
-          # not sit open forever.
-          printf '%s' "$open_issues" | jq -r '.[].title' \
-            | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | while read -r old; do
-            [ -z "$old" ] && continue
-            if ! printf '%s\n' "$cves" | grep -qx "$old"; then
-              num=$(printf '%s' "$open_issues" | jq -r --arg c "$old" \
-                '.[] | select(.title | contains($c)) | .number' | head -1)
-              [ -n "$num" ] && gh issue close "$num" --repo "$REPO" \
-                --comment "No longer detected in the scheduled scan (${today}) — closing."
+          failed=0
+          # Close first, so an issue for a finding the image no longer carries does
+          # not sit open forever. CVE, GHSA and GO identifiers alike.
+          old_ids=$(printf '%s' "$open_issues" | jq -r '.[].title' | { grep -oE "$id_re" || true; } | sort -u)
+          while read -r old; do
+            [ -n "$old" ] || continue
+            if printf '%s\n' "$cves" | grep -qxF "$old"; then continue; fi
+            num=$(printf '%s' "$open_issues" | jq -r --arg c "$old" \
+              '.[] | select(.title | contains($c)) | .number' | head -1)
+            if [ -z "$num" ]; then continue; fi
+            if gh issue close "$num" --repo "$REPO" \
+                 --comment "No longer detected in the scheduled scan (${today}) — closing." >/dev/null; then
+              echo "#${num} ${old}: closed"
+            else
+              echo "::error::could not close #${num}"; failed=1
             fi
-          done
+          done <<< "$old_ids"
 
           if [ -z "$cves" ]; then
             echo "No CRITICAL or HIGH findings."
-            exit 0
+            exit "$failed"
           fi
 
-          printf '%s\n' "$cves" | while read -r cve; do
-            [ -z "$cve" ] && continue
+          while read -r cve; do
+            [ -n "$cve" ] || continue
             row=$(jq -r --arg cve "$cve" '
               .Results[]?.Vulnerabilities[]? |
               select(.VulnerabilityID == $cve) |
-              "\(.Severity)\t\(.PkgName)\t\(.FixedVersion // "unknown")\t\(.PkgID // "")"
+              "\(.Severity)\t\(.PkgName)\t\(.FixedVersion // "unknown")"
             ' trivy.json | head -1)
-            [ -z "$row" ] && continue
+            [ -n "$row" ] || continue
             severity=$(printf '%s' "$row" | cut -f1)
             pkg=$(printf '%s' "$row" | cut -f2)
             fixed=$(printf '%s' "$row" | cut -f3)
+            [ -n "$fixed" ] || fixed="unknown"
 
             labels="security,severity:$(printf '%s' "$severity" | tr '[:upper:]' '[:lower:]')"
-            [ "$fixed" = "unknown" ] && labels="${labels},no-fix-available"
+            if [ "$fixed" = "unknown" ]; then labels="${labels},no-fix-available"; fi
 
             existing=$(printf '%s' "$open_issues" | jq -r --arg c "$cve" \
               '.[] | select(.title | contains($c)) | .number' | head -1)
 
             if [ -n "$existing" ]; then
-              gh issue comment "$existing" --repo "$REPO" \
-                --body "Still detected in the scheduled scan (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`."
+              if gh issue comment "$existing" --repo "$REPO" \
+                   --body "Still detected in the scheduled scan (${today}). Package \`${pkg}\`, fixed in \`${fixed}\`." >/dev/null; then
+                echo "#${existing} ${cve}: still present"
+              else
+                echo "::error::could not comment on #${existing} for ${cve}"; failed=1
+              fi
             else
               body=$(printf '**CVE:** %s\n**Severity:** %s\n**Package:** `%s`\n**Fixed in:** `%s`\n**First detected:** %s\n\nTo accept this deliberately, add it to `.trivyignore` with a reason:\n\n```\n%s  # reason accepted\n```\n' \
                 "$cve" "$severity" "$pkg" "$fixed" "$today" "$cve")
-              gh issue create --repo "$REPO" \
-                --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
-                --body "$body" --label "$labels"
+              if gh issue create --repo "$REPO" \
+                   --title "[SECURITY] ${cve}: ${pkg} (${severity})" \
+                   --body "$body" --label "$labels" >/dev/null; then
+                echo "${cve}: issue opened"
+              else
+                echo "::error::could not open an issue for ${cve}"; failed=1
+              fi
             fi
-          done
+          done <<< "$cves"
+          exit "$failed"
 
   # Dependabot handles Go modules. Nothing handles the base image's OS packages,
   # which is the gap this closes: a single alpine base can still carry CVEs, and
@@ -359,7 +386,9 @@ jobs:
               echo "**Stale pins removed** — the base image now ships these fixes natively."
             fi
             echo ""
-            printf '%s' "$cve_map" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /'
+            # Empty when the only change is removing stale pins; under bash -e
+            # a grep with nothing to match would end the step here.
+            printf '%s' "$cve_map" | tr ' ' '\n' | { grep -v '^$' || true; } | sed 's/^/- /'
           } > /tmp/pr.md
 
       # The branch, commit and push are this action's job. It takes the
