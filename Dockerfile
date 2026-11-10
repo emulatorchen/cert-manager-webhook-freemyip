@@ -26,7 +26,11 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
 # ── Runtime image ────────────────────────────────────────────────────────────
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
-RUN apk add --no-cache ca-certificates
+# The base digest can lag behind a zlib fix that Alpine has already shipped in
+# this branch. Upgrading by name, not pinning a version, picks up the fix and
+# never breaks when Alpine retires an old package. The release still scans the
+# image it actually built.
+RUN apk upgrade --no-cache zlib && apk add --no-cache ca-certificates
 
 COPY --from=build /workspace/webhook /usr/local/bin/webhook
 
